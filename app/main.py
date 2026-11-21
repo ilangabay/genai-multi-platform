@@ -11,10 +11,11 @@ import itertools
 import os
 import re
 import secrets
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import Body, Cookie, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Body, Cookie, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -51,7 +52,7 @@ for _name, _owner, _members, _budget, _spend in [
     ("Contract review", "bob", ["alice", "carol"], 20.0, 3.1),
     ("HR chatbot", "carol", [], 100.0, 41.75),
 ]:
-    litellm.TEAMS[add_project(_name, _owner, _members, _budget)["team_id"]]["spend"] = _spend  # mock seed only
+    litellm.seed_history(add_project(_name, _owner, _members, _budget)["team_id"], _spend, seed=len(PROJECTS))  # mock only
 
 SESSIONS: dict[str, dict] = {}
 
@@ -148,6 +149,23 @@ def list_models(user: dict = Depends(current_user)):
              "output": i["output_cost_per_token"] * 1e6,
              "cached": i["cache_read_input_token_cost"] * 1e6 if "cache_read_input_token_cost" in i else None}
             for m in litellm.model_info() for i in [m["model_info"]]]
+
+
+@app.get("/api/usage")
+def usage(days: int = Query(30, ge=1, le=366), user: dict = Depends(current_user)):
+    """Daily spend and tokens per project and model, for the projects this user can see."""
+    today = datetime.now(timezone.utc).date()
+    dates = [str(today - timedelta(days=d)) for d in range(days - 1, -1, -1)]
+    teams = {p["team_id"]: p["id"] for p in PROJECTS.values() if visible(p, user)}
+    agg = defaultdict(lambda: [0.0, 0])
+    # shortcut: sums raw per-call rows in Python; at volume, query LiteLLM's daily spend tables instead
+    for r in litellm.spend_logs(dates[0]):
+        if r["team_id"] in teams:
+            a = agg[(r["startTime"][:10], teams[r["team_id"]], r["model_group"])]
+            a[0] += r["spend"]
+            a[1] += r["total_tokens"]
+    return {"days": dates, "rows": [{"date": d, "project": p, "model": m, "spend": s, "tokens": t}
+                                    for (d, p, m), (s, t) in sorted(agg.items())]}
 
 
 @app.get("/api/users")

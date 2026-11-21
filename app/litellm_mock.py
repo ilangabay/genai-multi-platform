@@ -13,9 +13,11 @@ over HTTP with the master key in production (/team/new, /team/update, /team/info
 import json
 import logging
 import os
+import random
 import secrets
 import threading
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Body, Header
 from fastapi.responses import JSONResponse
@@ -77,6 +79,7 @@ MODELS = {m["model_name"]: m for m in MODEL_LIST}
 
 TEAMS: dict[str, dict] = {}  # team_id -> {team_alias, max_budget, spend}
 KEYS: dict[str, str] = {}    # virtual key -> team_id
+SPEND_LOGS: list[dict] = []  # one row per call, like LiteLLM_SpendLogs
 LOCK = threading.Lock()
 
 
@@ -106,6 +109,36 @@ def key_generate(team_id: str) -> dict:
     key = "sk-" + secrets.token_urlsafe(24)
     KEYS[key] = team_id
     return {"key": key, "team_id": team_id}
+
+
+def spend_logs(start_date: str) -> list[dict]:
+    """Rows since start_date (YYYY-MM-DD, UTC). Production: LiteLLM's /spend/logs, or a query on its spend tables."""
+    return [r for r in SPEND_LOGS if r["startTime"][:10] >= start_date]
+
+
+def seed_history(team_id: str, total_spend: float, days: int = 90, seed: int = 0):
+    """Mock only: daily spend rows over the last `days` days, Bedrock rows adding up to total_spend."""
+    rng = random.Random(seed)
+    today = datetime.now(timezone.utc).date()
+    weights = [rng.choice([0, 0.3, 1, 2]) for _ in MODEL_LIST]  # each team favors a few models
+    rows = []
+    for d in range(days):
+        day = today - timedelta(days=days - 1 - d)
+        load = (0.4 + d / days) * (0.25 if day.weekday() >= 5 else 1) * rng.uniform(0.6, 1.4)
+        for m, w in zip(MODEL_LIST, weights):
+            tokens = int(load * w * rng.uniform(0.5, 1.5) * 200_000)
+            if tokens:
+                i = m["model_info"]
+                cost = tokens * (0.8 * i["input_cost_per_token"] + 0.2 * i["output_cost_per_token"])
+                rows.append({"startTime": f"{day}T12:00:00+00:00", "team_id": team_id, "model_group": m["model_name"],
+                             "spend": cost, "total_tokens": tokens})
+    raw = sum(r["spend"] for r in rows)
+    for r in rows:  # scale paid rows so the history matches the seeded spend
+        if raw and r["spend"]:
+            r["spend"] *= total_spend / raw
+            r["total_tokens"] = int(r["total_tokens"] * total_spend / raw)
+    SPEND_LOGS.extend(rows)
+    TEAMS[team_id]["spend"] = sum(r["spend"] for r in rows) if raw else total_spend
 
 
 def key_delete(keys: list[str]) -> dict:
@@ -153,6 +186,8 @@ def _call(authorization: str, model_name, payload):
     cost = _cost(model["model_info"], usage)
     with LOCK:
         team["spend"] += cost
+        SPEND_LOGS.append({"startTime": datetime.now(timezone.utc).isoformat(timespec="seconds"), "team_id": team_id,
+                           "model_group": model_name, "spend": cost, "total_tokens": sum(usage.values())})
     return model, usage, cost
 
 

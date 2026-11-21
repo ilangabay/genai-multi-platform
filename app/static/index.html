@@ -71,6 +71,26 @@
   .fb { padding: 10px 0; border-bottom: 1px solid var(--line); white-space: pre-wrap; }
   .fb:last-child { border-bottom: 0; }
   td .tools input { width: 160px; }
+
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-top: 20px; }
+  .kpis > .card { margin-top: 0; }
+  .kpi .v { font-size: 28px; font-weight: 600; }
+  .chart { position: relative; }
+  .chart svg { width: 100%; height: auto; display: block; }
+  .chart svg:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+  .chart text { fill: #898781; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .tip { position: absolute; top: 8px; pointer-events: none; background: #fff; border: 1px solid var(--line); border-radius: 8px;
+         padding: 8px 10px; font-size: 13px; box-shadow: 0 4px 16px #0f172a1a; min-width: 180px; z-index: 2; }
+  .tip .r { display: flex; align-items: center; gap: 8px; }
+  .tip .r b { margin-left: auto; padding-left: 16px; font-variant-numeric: tabular-nums; }
+  .key-line { width: 12px; height: 2px; border-radius: 1px; flex-shrink: 0; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 10px; font-size: 13px; color: var(--muted); }
+  .legend .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; margin-right: 6px; vertical-align: -1px; }
+  .legend b { color: var(--text); font-weight: 500; margin-left: 4px; }
+  details.tbl { border: 0; margin-top: 6px; }
+  details.tbl summary { padding: 6px 0; font-size: 13px; color: var(--muted); }
+  details.tbl .wrap { max-height: 320px; overflow: auto; }
+  details.tbl table { font-size: 13px; font-variant-numeric: tabular-nums; }
   details { border-bottom: 1px solid var(--line); }
   summary { display: flex; align-items: center; gap: 12px; padding: 10px 6px; cursor: pointer; list-style: none; }
   summary::-webkit-details-marker { display: none; }
@@ -115,6 +135,7 @@
   <nav>
     <div class="brand">GenAI Gateway</div>
     <a href="#" data-view="overview">Overview</a>
+    <a href="#" data-view="usage" id="nav-usage" class="hidden">Usage</a>
     <div class="section">Projects</div>
     <div id="nav-projects"></div>
     <div class="section">Workspace</div>
@@ -146,8 +167,9 @@ async function api(path, opts = {}) {
 // ---------- login ----------
 async function boot() {
   try { me = await api('/api/me'); } catch { return showLogin(); }
-  [projects, models, cfg] = await Promise.all([api('/api/projects'), api('/api/models'), api('/api/config'), loadInbox()]);
+  [projects, models, cfg] = await Promise.all([api('/api/projects'), api('/api/models'), api('/api/config'), loadInbox(), loadUsage()]);
   users = me.role === 'admin' ? await api('/api/users') : [];
+  $('#nav-usage').classList.toggle('hidden', me.role !== 'admin');
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
   $('#whoami').textContent = `${me.username} · ${me.role}`;
@@ -183,12 +205,12 @@ $('#logout').onclick = async () => { await api('/api/logout', { method: 'POST' }
 document.querySelector('nav').onclick = async e => {
   const a = e.target.closest('a'); if (!a) return;
   e.preventDefault(); view = a.dataset.project || a.dataset.view; showKey = false; creating = false;
-  if (view === 'requests' || view === 'feedback') await loadInbox();
+  await (view === 'requests' || view === 'feedback' ? loadInbox() : loadUsage());
   render(); scrollTo(0, 0);
 };
 $('#main').addEventListener('click', async e => {
   const row = e.target.closest('[data-open]');
-  if (row) { view = row.dataset.open; render(); }
+  if (row) { view = row.dataset.open; await loadUsage(); render(); }
   const req = e.target.closest('[data-request]');
   if (req) { reqDraft = { kind: req.dataset.request, project: req.dataset.project || '' }; view = 'requests'; await loadInbox(); render(); scrollTo(0, 0); }
   const c = e.target.closest('[data-copy]');
@@ -213,7 +235,7 @@ function flash(btn, label) {
   setTimeout(() => { btn.textContent = old; btn.classList.remove('done'); }, 1500);
 }
 
-async function refresh() { projects = await api('/api/projects'); render(); }
+async function refresh() { [projects] = await Promise.all([api('/api/projects'), loadUsage()]); render(); }
 async function loadInbox() { [requests, feedback] = await Promise.all([api('/api/requests'), api('/api/feedback')]); }
 
 function render() {
@@ -223,7 +245,8 @@ function render() {
   $('#pending').textContent = me.role === 'admin' ? requests.filter(r => r.status === 'pending').length || '' : '';
   const p = projects.find(p => p.id === view);
   $('#main').innerHTML = p ? projectView(p) : view === 'docs' ? docsView() : view === 'requests' ? requestsView()
-    : view === 'feedback' ? feedbackView() : overview();
+    : view === 'feedback' ? feedbackView() : view === 'usage' && me.role === 'admin' ? usageView() : overview();
+  bindCharts();
   if (p) bindProject(p);
   if (view === 'overview' && creating) bindCreate();
   if (view === 'requests') bindRequests();
@@ -343,6 +366,9 @@ function projectView(p) {
         <button class="ghost" id="regen">${p.api_key ? 'Regenerate key' : 'Create new key'}</button></div>` : ''}
     </div></div>
 
+    <div class="card"><div class="head"><h3>Usage per model</h3><div class="tools">${usageFilters()}</div></div>
+      ${chart('project-models', `${p.name} usage per model`, series(r => r.model, models.map(m => [m.id, m.id]), r => r.project === p.id))}</div>
+
     <div class="card"><div class="head"><h3>Models</h3>
         <div class="tools">${seg('kind', apiKind, [['chat', 'Chat Completions'], ['responses', 'Responses']])}
           ${seg('lang', lang, [['curl', 'curl'], ['python', 'Python']])}</div></div>
@@ -404,6 +430,123 @@ function bindProject(p) {
     det.open = true;
     det.querySelector('.try-result').innerHTML = msg;
   });
+}
+
+// ---------- usage charts (plain SVG: no CDN in the air gap) ----------
+// categorical slots in fixed order, validated for adjacent marks; color follows the entity, never its rank
+const PALETTE = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#6250d6', '#e34948'];
+const CH = 260, CL = 56, CR = 8, CT = 10, CB = 28, PH = CH - CT - CB;
+// draw at the width the card will have, so text stays 12px; the viewBox only rescales on window resize
+const chartWidth = () => { const m = $("#main"), cs = getComputedStyle(m); return Math.max(320, m.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 42); };
+let usage, period = 30, metric = 'spend';
+const charts = {};
+
+async function loadUsage() { usage = { period, ...await api(`/api/usage?days=${period}`) }; }
+const compact = n => n >= 1e6 ? +(n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? +(n / 1e3).toFixed(1) + 'K' : String(+n.toFixed(2));
+const fmt = n => metric === 'spend' ? usd(n) : compact(n);
+const tick = v => metric === 'spend' ? '$' + (v >= 1000 ? compact(v) : +v.toFixed(4)) : compact(v);
+const day = (d, long) => new Date(d + 'T00:00:00Z').toLocaleDateString('en', { month: 'short', day: 'numeric', ...(long && { weekday: 'short' }), timeZone: 'UTC' });
+const usageFilters = () => `${seg('period', String(period), [['7', '7 days'], ['30', '30 days'], ['90', '90 days']])}
+  ${seg('metric', metric, [['spend', 'Spend'], ['tokens', 'Tokens']])}`;
+
+// usage rows -> one series per entity (key(row) matches an [id, label] pair, fixed order); past 8, the tail folds into "Other"
+function series(key, entities, keep = () => true) {
+  const at = Object.fromEntries(usage.days.map((d, i) => [d, i])), fold = entities.length > 8;
+  const list = (fold ? entities.slice(0, 7) : entities).map(([id, name], i) => ({ id, name, color: PALETTE[i], values: usage.days.map(() => 0) }));
+  if (fold) list.push({ id: null, name: 'Other', color: '#898781', values: usage.days.map(() => 0) });
+  for (const r of usage.rows) {
+    if (!keep(r)) continue;
+    const s = list.find(s => s.id === key(r)) || (fold && list.at(-1));
+    if (s) s.values[at[r.date]] += r[metric];
+  }
+  return list.filter(s => s.values.some(v => v));
+}
+
+function niceScale(max) {
+  if (!max) return { max: 1, step: 0.25 };
+  const raw = max / 4, mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw);
+  return { max: Math.ceil(max / step - 1e-9) * step, step };
+}
+
+const roundTop = (x, y, w, h, r) => (r = Math.min(r, w / 2, h),
+  `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`);
+
+// stacked daily columns: 2px surface gap between segments, 4px rounded top, square at the baseline
+function chart(id, title, list) {
+  if (!usage) return '<p class="muted">Loading…</p>';
+  if (!list.length) return `<p class="muted" style="margin:0">No ${metric === 'spend' ? 'spend' : 'tokens'} in the last ${period} days.</p>`;
+  const CW = chartWidth(), PW = CW - CL - CR;
+  charts[id] = { list, CW };
+  const n = usage.days.length, band = PW / n, bw = Math.min(24, Math.max(2, band - 2));
+  const totals = usage.days.map((_, i) => list.reduce((a, s) => a + s.values[i], 0));
+  const { max, step } = niceScale(Math.max(...totals)), y = v => v / max * PH;
+  let grid = '', marks = '', labels = '';
+  for (let k = 0; k * step <= max + 1e-9; k++) {
+    const yy = CT + PH - y(k * step);
+    grid += `<line x1="${CL}" x2="${CW - CR}" y1="${yy}" y2="${yy}" stroke="${k ? '#e1e0d9' : '#c3c2b7'}"/>
+      <text x="${CL - 8}" y="${yy + 4}" text-anchor="end">${tick(k * step)}</text>`;
+  }
+  usage.days.forEach((_, i) => {
+    const x = CL + i * band + (band - bw) / 2, segs = list.filter(s => s.values[i] > 0);
+    let base = CT + PH;
+    segs.forEach((s, k) => {
+      const h = y(s.values[i]), hh = h - (k ? 2 : 0);
+      if (hh > 0.5) marks += k === segs.length - 1 ? `<path d="${roundTop(x, base - h, bw, hh, 4)}" fill="${s.color}"/>`
+                                                   : `<rect x="${x}" y="${base - h}" width="${bw}" height="${hh}" fill="${s.color}"/>`;
+      base -= h;
+    });
+  });
+  for (let i = n - 1; i >= 0; i -= Math.ceil(n / 6)) labels += `<text x="${CL + (i + 0.5) * band}" y="${CH - 8}" text-anchor="middle">${day(usage.days[i])}</text>`;
+  const sum = s => s.values.reduce((a, v) => a + v, 0);
+  const legend = list.length > 1 ? `<div class="legend">${list.map(s =>
+    `<span><i class="sw" style="background:${s.color}"></i>${esc(s.name)}<b>${fmt(sum(s))}</b></span>`).join('')}</div>` : '';
+  const rows = usage.days.map((d, i) => [d, i]).filter(([, i]) => totals[i]).reverse();
+  return `<div class="chart"><svg viewBox="0 0 ${CW} ${CH}" role="img" tabindex="0" data-chart="${id}"
+      aria-label="${esc(title)}: daily ${metric} over the last ${n} days. Use arrow keys for daily values, or open the table.">
+      <rect class="hover" y="${CT}" height="${PH}" fill="#eff4ff" visibility="hidden"/>${grid}${marks}${labels}</svg>
+      <div class="tip hidden" role="status"></div></div>${legend}
+    <details class="tbl"><summary>Table</summary><div class="wrap"><table>
+      <tr><th>Day</th>${list.map(s => `<th>${esc(s.name)}</th>`).join('')}${list.length > 1 ? '<th>Total</th>' : ''}</tr>
+      ${rows.map(([d, i]) => `<tr><td>${day(d, true)}</td>${list.map(s => `<td>${fmt(s.values[i])}</td>`).join('')}${list.length > 1 ? `<td>${fmt(totals[i])}</td>` : ''}</tr>`).join('')}
+    </table></div></details>`;
+}
+
+function bindCharts() {
+  document.querySelectorAll('[data-period]').forEach(b => b.onclick = async () => { period = +b.dataset.period; await loadUsage(); render(); });
+  document.querySelectorAll('[data-metric]').forEach(b => b.onclick = () => { metric = b.dataset.metric; render(); });
+  document.querySelectorAll('svg[data-chart]').forEach(svg => {
+    const { list, CW } = charts[svg.dataset.chart], n = usage.days.length, band = (CW - CL - CR) / n;
+    const tip = svg.nextElementSibling, hover = svg.querySelector('.hover');
+    let idx = n - 1;
+    const show = i => {
+      idx = Math.max(0, Math.min(n - 1, i));
+      hover.setAttribute('x', CL + idx * band); hover.setAttribute('width', band); hover.setAttribute('visibility', 'visible');
+      const total = list.reduce((a, s) => a + s.values[idx], 0);
+      tip.innerHTML = `<div class="muted">${day(usage.days[idx], true)}</div>`
+        + (list.length > 1 ? `<div class="r">Total<b>${fmt(total)}</b></div>` : `<div class="r">${esc(list[0].name)}<b>${fmt(total)}</b></div>`)
+        + (list.length > 1 ? list.map(s => `<div class="r"><i class="key-line" style="background:${s.color}"></i>${esc(s.name)}<b>${fmt(s.values[idx])}</b></div>`).join('') : '');
+      tip.classList.remove('hidden');
+      const w = svg.getBoundingClientRect().width, x = (CL + (idx + 0.5) * band) / CW * w;
+      tip.style.left = (x + 14 + tip.offsetWidth > w ? x - 14 - tip.offsetWidth : x + 14) + 'px';
+    };
+    const hide = () => { tip.classList.add('hidden'); hover.setAttribute('visibility', 'hidden'); };
+    svg.onpointermove = e => { const b = svg.getBoundingClientRect(); show(Math.floor(((e.clientX - b.left) / b.width * CW - CL) / band)); };
+    svg.onpointerleave = hide; svg.onblur = hide; svg.onfocus = () => show(idx);
+    svg.onkeydown = e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); show(idx + (e.key === 'ArrowRight' ? 1 : -1)); } };
+  });
+}
+
+function usageView() {
+  const total = k => usage.rows.reduce((a, r) => a + r[k], 0);
+  return `<h2>Usage</h2>
+    <p class="muted">Spend as billed by LiteLLM from provider token counts. On-prem models are free: switch to Tokens to see their load.</p>
+    <div class="tools" style="margin-top:16px">${usageFilters()}</div>
+    <div class="kpis"><div class="card kpi"><h3>Spend, last ${period} days</h3><div class="v">${usd(total('spend'))}</div></div>
+      <div class="card kpi"><h3>Tokens, last ${period} days</h3><div class="v">${compact(total('tokens'))}</div></div></div>
+    <div class="card"><h3>Overall</h3>${chart('overall', 'All projects', series(() => 'all', [['all', 'All projects']]))}</div>
+    <div class="card"><h3>Per model</h3>${chart('models', 'Per model', series(r => r.model, models.map(m => [m.id, m.id])))}</div>
+    <div class="card"><h3>Per project</h3>${chart('projects', 'Per project', series(r => r.project, projects.map(p => [p.id, p.name])))}</div>`;
 }
 
 // ---------- requests ----------
@@ -532,7 +675,8 @@ function docsView() {
     <p>Each project has a budget in USD. Every call is charged with the token counts reported by the model provider,
     at the prices shown on the project page. Cached input tokens (prompt caching on Bedrock) are charged at the lower cached price.
     The cost of each call is returned in the <code>x-litellm-response-cost</code> response header.
-    On-prem models are free and never use budget.</p>
+    On-prem models are free and never use budget.
+    The <b>Usage per model</b> chart on the project page shows daily spend or tokens per model over 7, 30 or 90 days.</p>
     <p>When the budget is spent, all calls of the project are rejected, on-prem ones included, until an admin raises it.
     The check runs before each call, so the last call can go slightly over budget.
     Only admins change budgets: use <b>Request budget increase</b> on the project page.</p>
@@ -553,7 +697,9 @@ function docsView() {
       <li><b>Requests</b> shows pending requests first, with a count in the sidebar. Approving a project request creates it with the
         requester as owner; approving a budget request adds the amount to the budget. A model request is only recorded:
         add the model to LiteLLM's config yourself.</li>
-      <li><b>Feedback</b> lists everything users sent.</li></ul>` : ''}
+      <li><b>Feedback</b> lists everything users sent.</li>
+      <li><b>Usage</b> shows daily spend or tokens overall, per model and per project. Tokens is the view for on-prem load,
+        since on-prem models cost nothing.</li></ul>` : ''}
   </div>`;
 }
 

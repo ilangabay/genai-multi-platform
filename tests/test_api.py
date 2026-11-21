@@ -173,3 +173,28 @@ def test_feedback():
     assert [f["message"] for f in carol.get("/api/feedback").json()] == ["Great"]
     assert login("alice", "user").get("/api/feedback").json() == []
     assert "Great" in [f["message"] for f in admin().get("/api/feedback").json()]
+
+
+def test_usage_is_scoped_and_matches_spend():
+    rows = admin().get("/api/usage?days=90").json()["rows"]
+    seeded = sum(r["spend"] for r in rows if r["project"] == "hr-chatbot")
+    assert abs(seeded - team("hr-chatbot")["spend"]) < 1e-6  # history adds up to the team spend
+    assert all(r["spend"] == 0 for r in rows if r["model"].endswith("-onprem"))
+    assert any(r["tokens"] for r in rows if r["model"].endswith("-onprem"))
+
+    carol = login("carol", "user")
+    mine = {p["id"] for p in carol.get("/api/projects").json()}
+    assert {r["project"] for r in carol.get("/api/usage?days=90").json()["rows"]} <= mine and "code-assistant" not in mine
+    data = carol.get("/api/usage?days=7").json()
+    assert len(data["days"]) == 7 and all(r["date"] >= data["days"][0] for r in data["rows"])
+    assert carol.get("/api/usage?days=0").status_code == 422
+
+
+def test_calls_show_up_in_usage_today():
+    a = admin()
+    def today_haiku():
+        return [r for r in a.get("/api/usage?days=1").json()["rows"]
+                if r["project"] == "contract-review" and r["model"] == "claude-haiku-5-5"]
+    before = sum(r["spend"] for r in today_haiku())
+    cost = float(call(a, main.PROJECTS["contract-review"]["api_key"], "claude-haiku-5-5").headers["x-litellm-response-cost"])
+    assert abs(sum(r["spend"] for r in today_haiku()) - before - cost) < 1e-9
