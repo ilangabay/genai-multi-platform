@@ -315,7 +315,7 @@ function projectView(p) {
           ${seg('lang', lang, [['curl', 'curl'], ['python', 'Python']])}</div></div>
       <p class="muted" style="margin:0 0 8px">Open a model to see a sample request. Set <code>GATEWAY_API_KEY</code> to this project's key first.</p>
       ${models.map(m => `<details><summary><code>${esc(m.id)}</code><span class="pill">${esc(m.platform)}</span>
-          <span class="price">$${m.input.toFixed(2)} in · $${m.output.toFixed(2)} out / 1M tokens</span></summary>
+          <span class="price">$${m.input.toFixed(2)} in${m.cached != null ? ` · $${m.cached.toFixed(2)} cached` : ''} · $${m.output.toFixed(2)} out / 1M tokens</span></summary>
         <div class="sample"><pre>${esc(sample(p.endpoint, m.id))}</pre>
           <div><button class="ghost" data-copy="${esc(sample(p.endpoint, m.id))}">Copy</button>
           <button class="ghost" data-try="${esc(m.id)}">Send mock request</button>
@@ -360,9 +360,11 @@ function bindProject(p) {
       });
       const d = await r.json();
       const text = r.ok && (chat ? d.choices[0].message.content : d.output_text);
-      msg = r.ok ? `<span class="muted">${esc(text)} Cost ${usd(d.x_cost_usd)} · ${usd(d.x_budget_remaining_usd)} left</span>`
-                 : `<span class="error">${r.status} · ${esc(d.error.message)}</span>`;
       await refresh();
+      const now = projects.find(x => x.id === p.id);
+      // cost as billed by LiteLLM, from the provider's usage block
+      msg = r.ok ? `<span class="muted">${esc(text)} Cost ${usd(Number(r.headers.get('x-litellm-response-cost')))} · ${usd(Math.max(0, now.budget - now.spent))} left</span>`
+                 : `<span class="error">${r.status} · ${esc(d.error.message)}</span>`;
     }
     const det = [...document.querySelectorAll('[data-try]')].find(x => x.dataset.try === model).closest('details');
     det.open = true;
@@ -396,14 +398,17 @@ function docsView() {
     LiteLLM also accepts Anthropic-format requests on <code>/v1/messages</code>, for tools that use the Anthropic SDK.</p>
 
     <h4>Budgets</h4>
-    <p>Each project has a budget in USD. Every call is charged by tokens used, at the prices shown on the project page.
-    When the budget is spent, calls are rejected until an admin raises it. Only admins can change budgets.</p>
+    <p>Each project has a budget in USD. Every call is charged with the token counts reported by the model provider,
+    at the prices shown on the project page. Cached input tokens (prompt caching on Bedrock) are charged at the lower cached price.
+    The cost of each call is returned in the <code>x-litellm-response-cost</code> response header.</p>
+    <p>When the budget is spent, calls are rejected until an admin raises it. The check runs before each call,
+    so the last call can go slightly over budget. Only admins can change budgets.</p>
 
     <h4>Errors</h4>
     <table><tr><th>Status</th><th>Code</th><th>Meaning</th></tr>
       <tr><td>401</td><td><code>invalid_api_key</code></td><td>Key is wrong or was revoked. Get the current key from the project page.</td></tr>
-      <tr><td>402</td><td><code>budget_exceeded</code></td><td>The project budget is spent. Ask an admin to raise it.</td></tr>
-      <tr><td>404</td><td><code>model_not_found</code></td><td>The model name is not in the catalog.</td></tr></table>
+      <tr><td>400</td><td><code>budget_exceeded</code></td><td>The project budget is spent. Ask an admin to raise it.</td></tr>
+      <tr><td>400</td><td><code>invalid_request_error</code></td><td>For example a model name that is not in your project's list.</td></tr></table>
 
     ${me.role === 'admin' ? `<h4>For admins</h4>
     <ul><li><b>New project</b> on the Overview page creates a project with its owner, members, budget and first API key.</li>

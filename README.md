@@ -49,8 +49,18 @@ Open http://localhost:8000 and pick **Sign in as user** or **Sign in as admin**.
 - Documentation tab, with an admin section.
 
 **Mock LLM endpoints**: `POST /v1/chat/completions` and `POST /v1/responses` (OpenAI formats, both exposed by LiteLLM).
-Each call charges the project budget by tokens; once the budget is spent it returns `402 budget_exceeded`.
-A revoked key returns `401 invalid_api_key`, an unknown model `404 model_not_found`.
+They live in `app/litellm_mock.py`, a stand-in for the LiteLLM proxy that behaves like it:
+
+- Each project is a LiteLLM **team** with `max_budget`; its API key is a virtual key of that team.
+  The governance layer only stores owner/members and reads budget and spend back from LiteLLM.
+- Cost = provider-reported usage (input, output, cache-read, cache-write tokens) × per-token prices
+  from LiteLLM's model config. It is returned in the `x-litellm-response-cost` header and added to the team spend.
+- Budget is checked before each call, so the last call can overshoot by one call.
+  Then calls get `400 budget_exceeded`. A revoked key gets `401`.
+
+In production, `app/litellm_mock.py` is replaced by HTTP calls to the LiteLLM admin API
+(`/team/new`, `/team/update`, `/team/info`, `/key/generate`, `/key/delete`, `/model/info`) with the master key,
+and Bedrock prices are loaded into LiteLLM from the AWS Price List API.
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -64,7 +74,8 @@ The `Demo sandbox` project (owner `alice`) has a $0.02 budget so you hit the lim
 
 | Path                    | What                                          |
 |-------------------------|-----------------------------------------------|
-| `app/main.py`           | FastAPI: auth, projects, admin API, mock LLM  |
+| `app/main.py`           | FastAPI: auth, projects, admin API            |
+| `app/litellm_mock.py`   | LiteLLM stand-in: teams, keys, budgets, LLM endpoints |
 | `app/static/index.html` | Whole UI (plain HTML/JS, no build step)       |
 | `tests/test_api.py`     | API tests                                     |
 

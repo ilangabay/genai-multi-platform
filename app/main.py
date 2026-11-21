@@ -1,63 +1,54 @@
 """Governance layer of the gateway VM (mock).
 
-Serves the web UI, the project/admin API and a mock OpenAI-compatible
-/v1/chat/completions that charges the project budget. No real LLM is called.
-In production, apps call the guardrail LiteLLM endpoint, which forwards to the
-LiteLLM router serving Bedrock and on-prem models; this mock stands in for both.
+Owns projects (name, owner, members) and the web UI. Money and keys live in LiteLLM:
+each project is a LiteLLM team with a max_budget, and its API key is a LiteLLM virtual key
+of that team. Spend is read back from LiteLLM, never computed here.
+In production, apps call the guardrail LiteLLM endpoint, which forwards to the LiteLLM router
+serving Bedrock and on-prem models; app/litellm_mock.py stands in for both.
 """
 import hmac
-import json
 import os
 import re
 import secrets
-import threading
 from pathlib import Path
 
-from fastapi import Body, Cookie, Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Body, Cookie, Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+
+from app import litellm_mock as litellm  # production: HTTP client for the LiteLLM admin API (master key)
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
 USER_PASSWORD = os.environ.get("USER_PASSWORD", "user")
 LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL")  # guardrail LiteLLM endpoint shown to users; defaults to this mock
 STATIC = Path(__file__).parent / "static"
 
-# shortcut: in-memory mock store, reset on restart; move to PostgreSQL (NUMERIC for money) for real use.
+# shortcut: in-memory mock store, reset on restart; move to PostgreSQL for real use.
 USERS = {"alice", "bob", "carol"}
-
-# Prices are USD per 1M tokens (input, output). Bedrock rates are indicative only.
-MODELS = [
-    {"id": "claude-opus-5-5", "platform": "Bedrock", "upstream": "eu.anthropic.claude-opus-5-5", "input": 4.0, "output": 20.0},
-    {"id": "claude-sonnet-5-5", "platform": "Bedrock", "upstream": "eu.anthropic.claude-sonnet-5-5", "input": 2.0, "output": 10.0},
-    {"id": "claude-haiku-5-5", "platform": "Bedrock", "upstream": "eu.anthropic.claude-haiku-5-5", "input": 0.1, "output": 0.5},
-    {"id": "mistral-small-onprem", "platform": "On-prem", "upstream": "vllm/mistral-small", "input": 0.05, "output": 0.15},
-    {"id": "llama-70b-onprem", "platform": "On-prem", "upstream": "vllm/llama-3.3-70b", "input": 0.2, "output": 0.6},
-]
-MODELS_BY_ID = {m["id"]: m for m in MODELS}
-MOCK_COMPLETION_TOKENS = 500
+PROJECTS: dict[str, dict] = {}  # id -> {id, name, owner, members, team_id, api_key}
 
 
-def new_key() -> str:
-    return "sk-gw-" + secrets.token_urlsafe(24)
+def add_project(name: str, owner: str, members: list[str], budget: float) -> dict:
+    pid = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    team = litellm.team_new(team_alias=pid, max_budget=budget)
+    PROJECTS[pid] = {"id": pid, "name": name, "owner": owner, "members": sorted(set(members) - {owner}),
+                     "team_id": team["team_id"], "api_key": litellm.key_generate(team["team_id"])["key"]}
+    return PROJECTS[pid]
 
 
-PROJECTS = {
-    p["id"]: p
-    for p in [
-        {"id": "code-assistant", "name": "Code assistant", "owner": "alice", "members": ["bob"], "budget": 50.0, "spent": 12.4},
-        {"id": "demo-sandbox", "name": "Demo sandbox", "owner": "alice", "members": [], "budget": 0.02, "spent": 0.0},
-        {"id": "contract-review", "name": "Contract review", "owner": "bob", "members": ["alice", "carol"], "budget": 20.0, "spent": 3.1},
-        {"id": "hr-chatbot", "name": "HR chatbot", "owner": "carol", "members": [], "budget": 100.0, "spent": 41.75},
-    ]
-}
-for _p in PROJECTS.values():
-    _p["api_key"] = new_key()
+for _name, _owner, _members, _budget, _spend in [
+    ("Code assistant", "alice", ["bob"], 50.0, 12.4),
+    ("Demo sandbox", "alice", [], 0.02, 0.0),
+    ("Contract review", "bob", ["alice", "carol"], 20.0, 3.1),
+    ("HR chatbot", "carol", [], 100.0, 41.75),
+]:
+    litellm.TEAMS[add_project(_name, _owner, _members, _budget)["team_id"]]["spend"] = _spend  # mock seed only
 
 SESSIONS: dict[str, dict] = {}
-LOCK = threading.Lock()  # budget check + debit must be atomic across worker threads
 
 app = FastAPI(title="GenAI gateway - governance (mock)")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+app.include_router(litellm.router)
 
 
 # ---------- auth ----------
@@ -111,15 +102,29 @@ def get_project(pid: str) -> dict:
     return PROJECTS[pid]
 
 
+def with_budget(p: dict) -> dict:
+    team = litellm.team_info(p["team_id"])
+    return {**p, "budget": team["max_budget"], "spent": team["spend"]}
+
+
+def valid_budget(budget: float):
+    if not budget >= 0:  # also rejects NaN
+        raise HTTPException(422, "Budget must be a positive number")
+
+
 @app.get("/api/projects")
 def list_projects(request: Request, user: dict = Depends(current_user)):
     endpoint = LITELLM_BASE_URL or str(request.base_url).rstrip("/") + "/v1"
-    return [{**p, "endpoint": endpoint} for p in PROJECTS.values() if visible(p, user)]
+    return [{**with_budget(p), "endpoint": endpoint} for p in PROJECTS.values() if visible(p, user)]
 
 
 @app.get("/api/models")
 def list_models(user: dict = Depends(current_user)):
-    return MODELS
+    # USD per 1M tokens for display, from LiteLLM's model config (the prices it bills with)
+    return [{"id": m["model_name"], "platform": i["platform"], "input": i["input_cost_per_token"] * 1e6,
+             "output": i["output_cost_per_token"] * 1e6,
+             "cached": i["cache_read_input_token_cost"] * 1e6 if "cache_read_input_token_cost" in i else None}
+            for m in litellm.model_info() for i in [m["model_info"]]]
 
 
 @app.get("/api/users")
@@ -138,111 +143,35 @@ def create_project(name: str = Body(...), owner: str = Body(...), members: list[
         raise HTTPException(409, "A project with this name already exists")
     if owner not in USERS or not set(members) <= USERS:
         raise HTTPException(422, "Unknown owner or member")
-    if not budget >= 0:
-        raise HTTPException(422, "Budget must be a positive number")
-    PROJECTS[pid] = {"id": pid, "name": name, "owner": owner, "members": sorted(set(members) - {owner}),
-                     "budget": budget, "spent": 0.0, "api_key": new_key()}
-    return PROJECTS[pid]
+    valid_budget(budget)
+    return with_budget(add_project(name, owner, members, budget))
 
 
 @app.patch("/api/projects/{pid}/budget")
 def set_budget(pid: str, budget: float = Body(..., embed=True), user: dict = Depends(admin_only)):
-    if not budget >= 0:  # also rejects NaN
-        raise HTTPException(422, "Budget must be a positive number")
+    valid_budget(budget)
     p = get_project(pid)
-    with LOCK:
-        p["budget"] = budget
-    return p
+    litellm.team_update(p["team_id"], max_budget=budget)
+    return with_budget(p)
 
 
 @app.post("/api/projects/{pid}/key/revoke")
 def revoke_key(pid: str, user: dict = Depends(admin_only)):
     p = get_project(pid)
+    if p["api_key"]:
+        litellm.key_delete([p["api_key"]])
     p["api_key"] = None
-    return p
+    return with_budget(p)
 
 
 @app.post("/api/projects/{pid}/key/regenerate")
 def regenerate_key(pid: str, user: dict = Depends(admin_only)):
     p = get_project(pid)
-    p["api_key"] = new_key()
-    return p
-
-
-# ---------- mock LLM endpoints (OpenAI-compatible shapes, as LiteLLM exposes them) ----------
-
-def oai_error(status: int, message: str, code: str) -> JSONResponse:
-    return JSONResponse({"error": {"message": message, "type": code, "code": code}}, status_code=status)
-
-
-def charge(authorization: str, model_id, payload):
-    """Authenticate the key, price the call and debit the budget. Returns (project, model, in_tok, cost) or an error."""
-    key = authorization.removeprefix("Bearer ").strip()
-    project = next((p for p in PROJECTS.values() if p["api_key"] and hmac.compare_digest(p["api_key"], key)), None)
-    if not project:
-        return oai_error(401, "Invalid or revoked API key.", "invalid_api_key")
-    model = MODELS_BY_ID.get(model_id)
-    if not model:
-        return oai_error(404, f"Model '{model_id}' is not available.", "model_not_found")
-
-    # shortcut: mock token count; in production cost comes from the provider's usage block via LiteLLM, never computed here.
-    in_tok = max(1, len(json.dumps(payload)) // 4)
-    cost = (in_tok * model["input"] + MOCK_COMPLETION_TOKENS * model["output"]) / 1_000_000
-    with LOCK:
-        remaining = project["budget"] - project["spent"]
-        if cost > remaining:
-            # 402 rather than 429 so OpenAI SDKs do not auto-retry
-            return oai_error(
-                402,
-                f"Budget exceeded for project '{project['name']}': ${max(remaining, 0):.6f} left, "
-                f"this call needs ${cost:.6f}. Ask an admin to raise the budget.",
-                "budget_exceeded",
-            )
-        project["spent"] += cost
-    return project, model, in_tok, cost
-
-
-def billing(project: dict, cost: float) -> dict:
-    return {"x_cost_usd": round(cost, 6), "x_budget_remaining_usd": round(project["budget"] - project["spent"], 6)}
-
-
-@app.post("/v1/chat/completions")
-def chat_completions(body: dict = Body(...), authorization: str = Header("")):
-    r = charge(authorization, body.get("model"), body.get("messages", []))
-    if isinstance(r, JSONResponse):
-        return r
-    project, model, in_tok, cost = r
-    return {
-        "id": "chatcmpl-mock-" + secrets.token_hex(6),
-        "object": "chat.completion",
-        "model": model["id"],
-        "choices": [{"index": 0, "finish_reason": "stop",
-                     "message": {"role": "assistant", "content": f"[mock] Response from {model['id']} ({model['platform']})."}}],
-        "usage": {"prompt_tokens": in_tok, "completion_tokens": MOCK_COMPLETION_TOKENS,
-                  "total_tokens": in_tok + MOCK_COMPLETION_TOKENS},
-        **billing(project, cost),
-    }
-
-
-@app.post("/v1/responses")
-def responses(body: dict = Body(...), authorization: str = Header("")):
-    r = charge(authorization, body.get("model"), [body.get("instructions", ""), body.get("input", "")])
-    if isinstance(r, JSONResponse):
-        return r
-    project, model, in_tok, cost = r
-    text = f"[mock] Response from {model['id']} ({model['platform']})."
-    return {
-        "id": "resp_mock_" + secrets.token_hex(6),
-        "object": "response",
-        "status": "completed",
-        "model": model["id"],
-        "output": [{"type": "message", "role": "assistant", "status": "completed",
-                    "content": [{"type": "output_text", "text": text, "annotations": []}]}],
-        "output_text": text,
-        "usage": {"input_tokens": in_tok, "output_tokens": MOCK_COMPLETION_TOKENS,
-                  "total_tokens": in_tok + MOCK_COMPLETION_TOKENS},
-        **billing(project, cost),
-    }
+    if p["api_key"]:
+        litellm.key_delete([p["api_key"]])
+    # the spend stays on the team, so a new key does not reset the budget
+    p["api_key"] = litellm.key_generate(p["team_id"])["key"]
+    return with_budget(p)
 
 
 @app.get("/")
