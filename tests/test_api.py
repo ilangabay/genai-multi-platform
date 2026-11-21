@@ -79,3 +79,13 @@ def test_admin_creates_project():
     assert a.post("/api/projects", json={"name": "Other", "owner": "mallory", "budget": 5}).status_code == 422
     assert "search-poc" in {p["id"] for p in login("carol", "user").get("/api/projects").json()}
     assert call(a, p["api_key"]).status_code == 200
+
+
+def test_responses_api_charges_same_budget():
+    p = main.PROJECTS["contract-review"]
+    before = p["spent"]
+    r = TestClient(main.app).post("/v1/responses", headers={"Authorization": f"Bearer {p['api_key']}"},
+                                  json={"model": "claude-haiku-5-5", "input": "hi"})
+    assert r.status_code == 200
+    assert r.json()["output"][0]["content"][0]["type"] == "output_text"
+    assert p["spent"] > before

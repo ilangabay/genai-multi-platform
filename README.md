@@ -40,7 +40,7 @@ Open http://localhost:8000 and pick **Sign in as user** or **Sign in as admin**.
 **Users** (see only projects they own or are a member of)
 - Budget used and left (read-only).
 - Endpoint and API key (show / copy).
-- Model catalog (Bedrock and on-prem) with prices, and a sample request per model (curl or Python OpenAI SDK) plus a "Send mock request" button.
+- Model catalog (Bedrock and on-prem) with prices, and a sample request per model (Chat Completions or Responses, curl or Python OpenAI SDK) plus a "Send mock request" button.
 - Documentation tab.
 
 **Admins**
@@ -48,7 +48,7 @@ Open http://localhost:8000 and pick **Sign in as user** or **Sign in as admin**.
 - Change budgets, revoke and regenerate API keys.
 - Documentation tab, with an admin section.
 
-**Mock LLM endpoint**: `POST /v1/chat/completions` (OpenAI format, like LiteLLM).
+**Mock LLM endpoints**: `POST /v1/chat/completions` and `POST /v1/responses` (OpenAI formats, both exposed by LiteLLM).
 Each call charges the project budget by tokens; once the budget is spent it returns `402 budget_exceeded`.
 A revoked key returns `401 invalid_api_key`, an unknown model `404 model_not_found`.
 

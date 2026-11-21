@@ -169,24 +169,25 @@ def regenerate_key(pid: str, user: dict = Depends(admin_only)):
     return p
 
 
-# ---------- mock LLM endpoint (OpenAI-compatible shape) ----------
+# ---------- mock LLM endpoints (OpenAI-compatible shapes, as LiteLLM exposes them) ----------
 
 def oai_error(status: int, message: str, code: str) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": code, "code": code}}, status_code=status)
 
 
-@app.post("/v1/chat/completions")
-def chat_completions(body: dict = Body(...), authorization: str = Header("")):
+def charge(authorization: str, model_id, payload):
+    """Authenticate the key, price the call and debit the budget. Returns (project, model, in_tok, cost) or an error."""
     key = authorization.removeprefix("Bearer ").strip()
     project = next((p for p in PROJECTS.values() if p["api_key"] and hmac.compare_digest(p["api_key"], key)), None)
     if not project:
         return oai_error(401, "Invalid or revoked API key.", "invalid_api_key")
-    model = MODELS_BY_ID.get(body.get("model"))
+    model = MODELS_BY_ID.get(model_id)
     if not model:
-        return oai_error(404, f"Model '{body.get('model')}' is not available.", "model_not_found")
+        return oai_error(404, f"Model '{model_id}' is not available.", "model_not_found")
 
-    prompt_tokens = max(1, len(json.dumps(body.get("messages", []))) // 4)  # rough mock tokenizer
-    cost = (prompt_tokens * model["input"] + MOCK_COMPLETION_TOKENS * model["output"]) / 1_000_000
+    # shortcut: mock token count; in production cost comes from the provider's usage block via LiteLLM, never computed here.
+    in_tok = max(1, len(json.dumps(payload)) // 4)
+    cost = (in_tok * model["input"] + MOCK_COMPLETION_TOKENS * model["output"]) / 1_000_000
     with LOCK:
         remaining = project["budget"] - project["spent"]
         if cost > remaining:
@@ -198,17 +199,49 @@ def chat_completions(body: dict = Body(...), authorization: str = Header("")):
                 "budget_exceeded",
             )
         project["spent"] += cost
+    return project, model, in_tok, cost
 
+
+def billing(project: dict, cost: float) -> dict:
+    return {"x_cost_usd": round(cost, 6), "x_budget_remaining_usd": round(project["budget"] - project["spent"], 6)}
+
+
+@app.post("/v1/chat/completions")
+def chat_completions(body: dict = Body(...), authorization: str = Header("")):
+    r = charge(authorization, body.get("model"), body.get("messages", []))
+    if isinstance(r, JSONResponse):
+        return r
+    project, model, in_tok, cost = r
     return {
         "id": "chatcmpl-mock-" + secrets.token_hex(6),
         "object": "chat.completion",
         "model": model["id"],
         "choices": [{"index": 0, "finish_reason": "stop",
                      "message": {"role": "assistant", "content": f"[mock] Response from {model['id']} ({model['platform']})."}}],
-        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": MOCK_COMPLETION_TOKENS,
-                  "total_tokens": prompt_tokens + MOCK_COMPLETION_TOKENS},
-        "x_cost_usd": round(cost, 6),
-        "x_budget_remaining_usd": round(project["budget"] - project["spent"], 6),
+        "usage": {"prompt_tokens": in_tok, "completion_tokens": MOCK_COMPLETION_TOKENS,
+                  "total_tokens": in_tok + MOCK_COMPLETION_TOKENS},
+        **billing(project, cost),
+    }
+
+
+@app.post("/v1/responses")
+def responses(body: dict = Body(...), authorization: str = Header("")):
+    r = charge(authorization, body.get("model"), [body.get("instructions", ""), body.get("input", "")])
+    if isinstance(r, JSONResponse):
+        return r
+    project, model, in_tok, cost = r
+    text = f"[mock] Response from {model['id']} ({model['platform']})."
+    return {
+        "id": "resp_mock_" + secrets.token_hex(6),
+        "object": "response",
+        "status": "completed",
+        "model": model["id"],
+        "output": [{"type": "message", "role": "assistant", "status": "completed",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}]}],
+        "output_text": text,
+        "usage": {"input_tokens": in_tok, "output_tokens": MOCK_COMPLETION_TOKENS,
+                  "total_tokens": in_tok + MOCK_COMPLETION_TOKENS},
+        **billing(project, cost),
     }
 
 
