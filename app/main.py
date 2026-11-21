@@ -7,9 +7,11 @@ In production, apps call the guardrail LiteLLM endpoint, which forwards to the L
 serving Bedrock and on-prem models; app/litellm_mock.py stands in for both.
 """
 import hmac
+import itertools
 import os
 import re
 import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Body, Cookie, Depends, FastAPI, HTTPException, Request, Response
@@ -21,19 +23,26 @@ from app import litellm_mock as litellm  # production: HTTP client for the LiteL
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
 USER_PASSWORD = os.environ.get("USER_PASSWORD", "user")
 LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL")  # guardrail LiteLLM endpoint shown to users; defaults to this mock
+DEFAULT_PROJECT_BUDGET = float(os.environ.get("DEFAULT_PROJECT_BUDGET", "100"))  # USD, new projects and project requests
 STATIC = Path(__file__).parent / "static"
 
 # shortcut: in-memory mock store, reset on restart; move to PostgreSQL for real use.
-USERS = {"alice", "bob", "carol"}
+USERS = {u.strip().lower() for u in os.environ.get("GATEWAY_USERS", "alice,bob,carol").split(",") if u.strip()}
 PROJECTS: dict[str, dict] = {}  # id -> {id, name, owner, members, team_id, api_key}
+REQUESTS: list[dict] = []  # project, budget and model requests from users
+FEEDBACK: list[dict] = []
 
 
 def add_project(name: str, owner: str, members: list[str], budget: float) -> dict:
-    pid = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    pid = slug(name)
     team = litellm.team_new(team_alias=pid, max_budget=budget)
     PROJECTS[pid] = {"id": pid, "name": name, "owner": owner, "members": sorted(set(members) - {owner}),
                      "team_id": team["team_id"], "api_key": litellm.key_generate(team["team_id"])["key"]}
     return PROJECTS[pid]
+
+
+def slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
 for _name, _owner, _members, _budget, _spend in [
@@ -107,6 +116,15 @@ def with_budget(p: dict) -> dict:
     return {**p, "budget": team["max_budget"], "spent": team["spend"]}
 
 
+def new_project_name(name: str) -> str:
+    name = name.strip()
+    if not slug(name):
+        raise HTTPException(422, "Project name is required")
+    if slug(name) in PROJECTS:
+        raise HTTPException(409, "A project with this name already exists")
+    return name
+
+
 def valid_budget(budget: float):
     if not budget >= 0:  # also rejects NaN
         raise HTTPException(422, "Budget must be a positive number")
@@ -118,9 +136,14 @@ def list_projects(request: Request, user: dict = Depends(current_user)):
     return [{**with_budget(p), "endpoint": endpoint} for p in PROJECTS.values() if visible(p, user)]
 
 
+@app.get("/api/config")
+def config(user: dict = Depends(current_user)):
+    return {"default_budget": DEFAULT_PROJECT_BUDGET, "bedrock_region": litellm.pricing.BEDROCK_REGION}
+
+
 @app.get("/api/models")
 def list_models(user: dict = Depends(current_user)):
-    # USD per 1M tokens for display, from LiteLLM's model config (the prices it bills with)
+    # USD per 1M tokens for display, from LiteLLM's model config (the prices it bills with). On-prem is 0.
     return [{"id": m["model_name"], "platform": i["platform"], "input": i["input_cost_per_token"] * 1e6,
              "output": i["output_cost_per_token"] * 1e6,
              "cached": i["cache_read_input_token_cost"] * 1e6 if "cache_read_input_token_cost" in i else None}
@@ -134,13 +157,8 @@ def list_users(user: dict = Depends(admin_only)):
 
 @app.post("/api/projects", status_code=201)
 def create_project(name: str = Body(...), owner: str = Body(...), members: list[str] = Body([]),
-                   budget: float = Body(...), user: dict = Depends(admin_only)):
-    name = name.strip()
-    pid = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    if not pid:
-        raise HTTPException(422, "Project name is required")
-    if pid in PROJECTS:
-        raise HTTPException(409, "A project with this name already exists")
+                   budget: float = Body(DEFAULT_PROJECT_BUDGET), user: dict = Depends(admin_only)):
+    name = new_project_name(name)
     if owner not in USERS or not set(members) <= USERS:
         raise HTTPException(422, "Unknown owner or member")
     valid_budget(budget)
@@ -172,6 +190,104 @@ def regenerate_key(pid: str, user: dict = Depends(admin_only)):
     # the spend stays on the team, so a new key does not reset the budget
     p["api_key"] = litellm.key_generate(p["team_id"])["key"]
     return with_budget(p)
+
+
+# ---------- requests and feedback ----------
+
+_ids = itertools.count(1)
+KINDS = {"project", "budget", "model"}
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def text(value: str, field: str, required: bool = True) -> str:
+    value = value.strip()
+    if required and not value:
+        raise HTTPException(422, f"{field} is required")
+    if len(value) > 2000:
+        raise HTTPException(422, f"{field} is too long (2000 characters max)")
+    return value
+
+
+def mine(items: list[dict], user: dict) -> list[dict]:
+    """Newest first; admins see everyone's."""
+    return [x for x in reversed(items) if user["role"] == "admin" or x["by"] == user["username"]]
+
+
+@app.get("/api/requests")
+def list_requests(user: dict = Depends(current_user)):
+    return mine(REQUESTS, user)
+
+
+@app.post("/api/requests", status_code=201)
+def create_request(kind: str = Body(...), name: str = Body(""), project: str = Body(""), amount: float = Body(0),
+                   reason: str = Body(""), user: dict = Depends(current_user)):
+    """kind=project: name, amount (budget). kind=budget: project, amount (USD to add). kind=model: name, project optional."""
+    if user["role"] != "user":
+        raise HTTPException(403, "Requests are made by users")
+    if kind not in KINDS:
+        raise HTTPException(422, "Unknown request kind")
+    req = {"id": next(_ids), "kind": kind, "by": user["username"], "created": now(), "status": "pending",
+           "reason": text(reason, "Reason", required=False), "name": "", "project": "", "amount": 0.0, "note": ""}
+    if kind == "project":
+        valid_budget(amount)
+        req |= {"name": new_project_name(text(name, "Project name")), "amount": amount or DEFAULT_PROJECT_BUDGET}
+    elif kind == "budget":
+        if not amount > 0:
+            raise HTTPException(422, "Amount must be more than 0")
+        if project not in PROJECTS or not visible(PROJECTS[project], user):
+            raise HTTPException(404, "Project not found")
+        req |= {"project": project, "amount": amount}
+    else:
+        if project and (project not in PROJECTS or not visible(PROJECTS[project], user)):
+            raise HTTPException(404, "Project not found")
+        req |= {"name": text(name, "Model name"), "project": project}
+    REQUESTS.append(req)
+    return req
+
+
+def get_request(rid: int) -> dict:
+    req = next((r for r in REQUESTS if r["id"] == rid), None)
+    if not req:
+        raise HTTPException(404, "Request not found")
+    if req["status"] != "pending":
+        raise HTTPException(409, "Request already decided")
+    return req
+
+
+def decide(req: dict, status: str, note: str, user: dict) -> dict:
+    req |= {"status": status, "note": text(note, "Note", required=False), "decided_by": user["username"], "decided": now()}
+    return req
+
+
+@app.post("/api/requests/{rid}/approve")
+def approve_request(rid: int, note: str = Body("", embed=True), user: dict = Depends(admin_only)):
+    req = get_request(rid)
+    if req["kind"] == "project":
+        add_project(new_project_name(req["name"]), req["by"], [], req["amount"])
+    elif req["kind"] == "budget":
+        team = litellm.team_info(get_project(req["project"])["team_id"])
+        litellm.team_update(team["team_id"], max_budget=team["max_budget"] + req["amount"])
+    # kind=model: the admin adds the model to LiteLLM's config; approving records the decision
+    return decide(req, "approved", note, user)
+
+
+@app.post("/api/requests/{rid}/reject")
+def reject_request(rid: int, note: str = Body("", embed=True), user: dict = Depends(admin_only)):
+    return decide(get_request(rid), "rejected", note, user)
+
+
+@app.get("/api/feedback")
+def list_feedback(user: dict = Depends(current_user)):
+    return mine(FEEDBACK, user)
+
+
+@app.post("/api/feedback", status_code=201)
+def send_feedback(message: str = Body(..., embed=True), user: dict = Depends(current_user)):
+    FEEDBACK.append({"id": len(FEEDBACK) + 1, "by": user["username"], "created": now(), "message": text(message, "Message")})
+    return FEEDBACK[-1]
 
 
 @app.get("/")

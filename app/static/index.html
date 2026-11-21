@@ -9,7 +9,7 @@
   * { box-sizing: border-box; }
   html { font-size: clamp(14px, 0.3vw + 10px, 16px); }
   body { margin: 0; font: 1rem/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); background: #fff; }
-  button, input, select { font: inherit; }
+  button, input, select, textarea { font: inherit; }
   button { border: 1px solid var(--blue); background: var(--blue); color: #fff; border-radius: 6px; padding: 6px 12px; cursor: pointer;
            transition: background .15s, color .15s, transform .05s; }
   button:hover { background: #1e40af; }
@@ -22,8 +22,9 @@
   button.done, button.done:hover { background: var(--blue-soft); color: var(--blue); border-color: var(--blue-soft); }
   button:disabled { opacity: .6; cursor: wait; }
   button.link { border: 0; background: none; color: var(--blue); padding: 0; }
-  input, select { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
-  input:focus, select:focus, button:focus-visible, summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  input, select, textarea { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+  textarea { width: 100%; resize: vertical; }
+  input:focus, select:focus, textarea:focus, button:focus-visible, summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
   code { font: 13px ui-monospace, Consolas, monospace; background: var(--blue-soft); padding: 3px 6px; border-radius: 4px; word-break: break-all; }
   pre { font: 13px/1.5 ui-monospace, Consolas, monospace; background: var(--blue-soft); padding: 12px 14px; border-radius: 6px; overflow-x: auto; margin: 0; }
   .hidden { display: none !important; }
@@ -62,7 +63,14 @@
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 500; font-size: 13px; }
   tr.click { cursor: pointer; } tr.click:hover { background: var(--blue-soft); }
-  .pill { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--blue-soft); color: var(--blue); }
+  .pill { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--blue-soft); color: var(--blue); white-space: nowrap; }
+  .pill.approved { background: #ecfdf5; color: #047857; }
+  .pill.rejected { background: #fef2f2; color: var(--red); }
+  .badge { background: #fff; color: var(--blue); border-radius: 9px; font-size: 11px; font-weight: 600; padding: 1px 7px; margin-left: 6px; }
+  .badge:empty { display: none; }
+  .fb { padding: 10px 0; border-bottom: 1px solid var(--line); white-space: pre-wrap; }
+  .fb:last-child { border-bottom: 0; }
+  td .tools input { width: 160px; }
   details { border-bottom: 1px solid var(--line); }
   summary { display: flex; align-items: center; gap: 12px; padding: 10px 6px; cursor: pointer; list-style: none; }
   summary::-webkit-details-marker { display: none; }
@@ -109,7 +117,9 @@
     <a href="#" data-view="overview">Overview</a>
     <div class="section">Projects</div>
     <div id="nav-projects"></div>
-    <div class="section">Help</div>
+    <div class="section">Workspace</div>
+    <a href="#" data-view="requests">Requests<span id="pending" class="badge"></span></a>
+    <a href="#" data-view="feedback">Feedback</a>
     <a href="#" data-view="docs">Documentation</a>
     <div class="foot"><div id="whoami"></div><button id="logout">Sign out</button></div>
   </nav>
@@ -120,7 +130,11 @@
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const usd = n => '$' + Number(n).toFixed(n < 1 ? 4 : 2);
-let me, projects = [], models = [], users = [], view = 'overview', showKey = false, creating = false, lang = 'curl', apiKind = 'chat', loginRole;
+const per1M = n => '$' + n.toFixed(n && n < 0.1 ? 3 : 2);
+const price = m => m.input || m.output
+  ? `${per1M(m.input)} in${m.cached != null ? ` · ${per1M(m.cached)} cached` : ''} · ${per1M(m.output)} out / 1M tokens` : 'Free';
+let me, cfg, projects = [], models = [], users = [], requests = [], feedback = [], view = 'overview', showKey = false, creating = false,
+    lang = 'curl', apiKind = 'chat', loginRole, reqDraft = { kind: 'project', project: '' };
 
 async function api(path, opts = {}) {
   const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
@@ -132,7 +146,7 @@ async function api(path, opts = {}) {
 // ---------- login ----------
 async function boot() {
   try { me = await api('/api/me'); } catch { return showLogin(); }
-  [projects, models] = await Promise.all([api('/api/projects'), api('/api/models')]);
+  [projects, models, cfg] = await Promise.all([api('/api/projects'), api('/api/models'), api('/api/config'), loadInbox()]);
   users = me.role === 'admin' ? await api('/api/users') : [];
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
@@ -166,13 +180,17 @@ $('#login-form').onsubmit = async e => {
 $('#logout').onclick = async () => { await api('/api/logout', { method: 'POST' }); view = 'overview'; showLogin(); };
 
 // ---------- navigation ----------
-document.querySelector('nav').onclick = e => {
+document.querySelector('nav').onclick = async e => {
   const a = e.target.closest('a'); if (!a) return;
-  e.preventDefault(); view = a.dataset.project || a.dataset.view; showKey = false; creating = false; render(); scrollTo(0, 0);
+  e.preventDefault(); view = a.dataset.project || a.dataset.view; showKey = false; creating = false;
+  if (view === 'requests' || view === 'feedback') await loadInbox();
+  render(); scrollTo(0, 0);
 };
-$('#main').addEventListener('click', e => {
+$('#main').addEventListener('click', async e => {
   const row = e.target.closest('[data-open]');
   if (row) { view = row.dataset.open; render(); }
+  const req = e.target.closest('[data-request]');
+  if (req) { reqDraft = { kind: req.dataset.request, project: req.dataset.project || '' }; view = 'requests'; await loadInbox(); render(); scrollTo(0, 0); }
   const c = e.target.closest('[data-copy]');
   if (c) copy(c.dataset.copy).then(() => flash(c, 'Copied ✓'), () => flash(c, 'Copy failed'));
 });
@@ -196,15 +214,20 @@ function flash(btn, label) {
 }
 
 async function refresh() { projects = await api('/api/projects'); render(); }
+async function loadInbox() { [requests, feedback] = await Promise.all([api('/api/requests'), api('/api/feedback')]); }
 
 function render() {
   $('#nav-projects').innerHTML = projects.map(p =>
     `<a href="#" data-project="${esc(p.id)}" class="${p.id === view ? 'active' : ''}">${esc(p.name)}</a>`).join('');
   document.querySelectorAll('[data-view]').forEach(a => a.classList.toggle('active', a.dataset.view === view));
+  $('#pending').textContent = me.role === 'admin' ? requests.filter(r => r.status === 'pending').length || '' : '';
   const p = projects.find(p => p.id === view);
-  $('#main').innerHTML = p ? projectView(p) : view === 'docs' ? docsView() : overview();
+  $('#main').innerHTML = p ? projectView(p) : view === 'docs' ? docsView() : view === 'requests' ? requestsView()
+    : view === 'feedback' ? feedbackView() : overview();
   if (p) bindProject(p);
   if (view === 'overview' && creating) bindCreate();
+  if (view === 'requests') bindRequests();
+  if (view === 'feedback') bindFeedback();
 }
 
 function bar(p) {
@@ -216,15 +239,24 @@ function bar(p) {
 function overview() {
   const admin = me.role === 'admin';
   return `<div class="head"><h2>${admin ? 'All projects' : 'My projects'}</h2>
-      ${admin && !creating ? '<button id="new-project">New project</button>' : ''}</div>
+      ${admin ? (creating ? '' : '<button id="new-project">New project</button>') : '<button class="ghost" data-request="project">Request a project</button>'}</div>
     <p class="muted">${projects.length} project${projects.length === 1 ? '' : 's'}</p>
     ${creating ? createForm() : ''}
-    <div class="card"><table>
+    <div class="card">${projects.length ? `<table>
       <tr><th>Project</th><th>Owner</th><th>Spent</th><th>Budget</th><th style="width:30%">Usage</th></tr>
       ${projects.map(p => `<tr class="click" data-open="${esc(p.id)}">
         <td>${esc(p.name)}</td><td>${esc(p.owner)}</td><td>${usd(p.spent)}</td><td>${usd(p.budget)}</td><td>${bar(p)}</td></tr>`).join('')}
-    </table></div>`;
+    </table>` : '<p class="muted" style="margin:0">No project yet. Request one to get an endpoint and an API key.</p>'}</div>
+
+    <div class="card"><div class="head"><h3>Available models</h3>
+        ${admin ? '' : '<button class="link" data-request="model">Request a model</button>'}</div>
+      <table><tr><th>Model</th><th>Platform</th><th>Price</th></tr>
+      ${models.map(m => `<tr><td><code>${esc(m.id)}</code></td><td><span class="pill">${esc(platform(m))}</span></td>
+        <td class="muted">${price(m)}</td></tr>`).join('')}</table>
+      <p class="muted" style="margin:12px 0 0">On-prem models are free. Sample requests for each model are on the project pages.</p></div>`;
 }
+
+const platform = m => m.platform === 'Bedrock' ? `Bedrock · ${cfg.bedrock_region}` : m.platform;
 
 function createForm() {
   return `<form class="card" id="create-form"><h3>New project</h3>
@@ -233,7 +265,7 @@ function createForm() {
       <label for="np-owner">Owner</label><select id="np-owner" name="owner">${users.map(u => `<option>${esc(u)}</option>`).join('')}</select>
       <span>Members</span><div class="checks">${users.map(u =>
         `<label><input type="checkbox" name="members" value="${esc(u)}"> ${esc(u)}</label>`).join('')}</div>
-      <label for="np-budget">Budget $</label><input id="np-budget" name="budget" type="number" min="0" step="0.01" value="100" required style="width:140px">
+      <label for="np-budget">Budget $</label><input id="np-budget" name="budget" type="number" min="0" step="0.01" value="${cfg.default_budget}" required style="width:140px">
     </div>
     <div class="row" style="margin:16px 0 0"><button>Create</button><button type="button" class="ghost" id="cancel-create">Cancel</button>
       <span id="create-error" class="error" role="alert"></span></div>
@@ -280,7 +312,7 @@ print(resp.output_text)`);
 }
 
 const seg = (name, cur, opts) => `<div class="seg" role="group" aria-label="${name}">${opts.map(([v, l]) =>
-  `<button class="${cur === v ? '' : 'ghost'}" data-${name}="${v}" aria-pressed="${cur === v}">${l}</button>`).join('')}</div>`;
+  `<button type="button" class="${cur === v ? '' : 'ghost'}" data-${name}="${v}" aria-pressed="${cur === v}">${l}</button>`).join('')}</div>`;
 
 function projectView(p) {
   const admin = me.role === 'admin';
@@ -294,7 +326,8 @@ function projectView(p) {
       ${bar(p)}
       ${admin ? `<div class="row" style="margin-top:12px"><label for="budget" class="label">Budget $</label>
         <input id="budget" type="number" min="0" step="0.01" value="${p.budget}" style="width:140px">
-        <button id="save-budget">Save</button></div>` : ''}
+        <button id="save-budget">Save</button></div>`
+        : `<button class="ghost" style="margin-top:12px" data-request="budget" data-project="${esc(p.id)}">Request budget increase</button>`}
     </div>
 
     <div class="card"><h3>Access</h3>
@@ -314,8 +347,8 @@ function projectView(p) {
         <div class="tools">${seg('kind', apiKind, [['chat', 'Chat Completions'], ['responses', 'Responses']])}
           ${seg('lang', lang, [['curl', 'curl'], ['python', 'Python']])}</div></div>
       <p class="muted" style="margin:0 0 8px">Open a model to see a sample request. Set <code>GATEWAY_API_KEY</code> to this project's key first.</p>
-      ${models.map(m => `<details><summary><code>${esc(m.id)}</code><span class="pill">${esc(m.platform)}</span>
-          <span class="price">$${m.input.toFixed(2)} in${m.cached != null ? ` · $${m.cached.toFixed(2)} cached` : ''} · $${m.output.toFixed(2)} out / 1M tokens</span></summary>
+      ${models.map(m => `<details><summary><code>${esc(m.id)}</code><span class="pill">${esc(platform(m))}</span>
+          <span class="price">${price(m)}</span></summary>
         <div class="sample"><pre>${esc(sample(p.endpoint, m.id))}</pre>
           <div><button class="ghost" data-copy="${esc(sample(p.endpoint, m.id))}">Copy</button>
           <button class="ghost" data-try="${esc(m.id)}">Send mock request</button>
@@ -363,13 +396,110 @@ function bindProject(p) {
       await refresh();
       const now = projects.find(x => x.id === p.id);
       // cost as billed by LiteLLM, from the provider's usage block
-      msg = r.ok ? `<span class="muted">${esc(text)} Cost ${usd(Number(r.headers.get('x-litellm-response-cost')))} · ${usd(Math.max(0, now.budget - now.spent))} left</span>`
+      const cost = Number(r.headers.get('x-litellm-response-cost'));
+      msg = r.ok ? `<span class="muted">${esc(text)} Cost ${cost ? usd(cost) : 'free'} · ${usd(Math.max(0, now.budget - now.spent))} left</span>`
                  : `<span class="error">${r.status} · ${esc(d.error.message)}</span>`;
     }
     const det = [...document.querySelectorAll('[data-try]')].find(x => x.dataset.try === model).closest('details');
     det.open = true;
     det.querySelector('.try-result').innerHTML = msg;
   });
+}
+
+// ---------- requests ----------
+const projectName = id => projects.find(p => p.id === id)?.name || id;
+
+function describe(r) {
+  if (r.kind === 'project') return `New project <b>${esc(r.name)}</b> · ${usd(r.amount)} budget`;
+  if (r.kind === 'budget') return `Budget +${usd(r.amount)} for <b>${esc(projectName(r.project))}</b>`;
+  return `Model <b>${esc(r.name)}</b>${r.project ? ` for ${esc(projectName(r.project))}` : ''}`;
+}
+
+function requestsView() {
+  const admin = me.role === 'admin';
+  const list = admin ? [...requests].sort((a, b) => (a.status !== 'pending') - (b.status !== 'pending')) : requests;
+  const pending = requests.filter(r => r.status === 'pending').length;
+  return `<h2>Requests</h2>
+    <p class="muted">${admin ? `${pending} pending. Approving a project or budget request applies it at once.`
+      : 'Ask the platform admins for a new project, a budget increase or a new model.'}</p>
+    ${admin ? '' : requestForm()}
+    <div class="card"><h3>${admin ? 'All requests' : 'My requests'}</h3>
+    ${list.length ? `<table><tr><th>Request</th>${admin ? '<th>From</th>' : ''}<th>Reason</th><th>Date</th><th>Status</th>${admin ? '<th></th>' : ''}</tr>
+      ${list.map(r => `<tr><td>${describe(r)}</td>${admin ? `<td>${esc(r.by)}</td>` : ''}
+        <td>${esc(r.reason)}</td><td class="muted" style="white-space:nowrap">${esc(r.created.slice(0, 10))}</td>
+        <td><span class="pill ${esc(r.status)}">${esc(r.status)}</span>${r.note ? `<div class="muted">${esc(r.note)}</div>` : ''}</td>
+        ${admin ? `<td>${r.status === 'pending' ? `<div class="tools"><input data-note="${r.id}" placeholder="Note (optional)" aria-label="Note">
+          <button data-decide="approve" data-id="${r.id}">Approve</button>
+          <button class="danger" data-decide="reject" data-id="${r.id}">Reject</button></div>` : ''}</td>` : ''}</tr>`).join('')}
+    </table>` : '<p class="muted" style="margin:0">No requests yet.</p>'}</div>`;
+}
+
+function requestForm() {
+  const k = reqDraft.kind;
+  const projectSelect = any => `<label for="rq-project">Project</label><select id="rq-project" name="project">
+    ${any ? '<option value="">Any project</option>' : ''}${projects.map(p =>
+      `<option value="${esc(p.id)}" ${p.id === reqDraft.project ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>`;
+  return `<form class="card" id="req-form"><h3>New request</h3>
+    <div style="margin-bottom:16px">${seg('rkind', k, [['project', 'New project'], ['budget', 'Budget increase'], ['model', 'New model']])}</div>
+    <div class="grid">
+      ${k === 'budget' ? projectSelect(false) : `<label for="rq-name">${k === 'model' ? 'Model' : 'Name'}</label>
+        <input id="rq-name" name="name" required maxlength="200" ${k === 'model' ? 'placeholder="Model name and platform"' : ''}>`}
+      ${k === 'model' ? projectSelect(true) : `<label for="rq-amount">${k === 'budget' ? 'Add $' : 'Budget $'}</label>
+        <input id="rq-amount" name="amount" type="number" min="0.01" step="0.01" required style="width:140px"
+          value="${k === 'project' ? cfg.default_budget : ''}">`}
+      <label for="rq-reason">Reason</label><textarea id="rq-reason" name="reason" rows="2" maxlength="2000"></textarea>
+    </div>
+    <div class="row" style="margin:16px 0 0"><button>Send request</button><span id="req-msg" role="status"></span></div>
+  </form>`;
+}
+
+function bindRequests() {
+  document.querySelectorAll('[data-rkind]').forEach(b => b.onclick = () => { reqDraft = { ...reqDraft, kind: b.dataset.rkind }; render(); });
+  const f = $('#req-form');
+  if (f) f.onsubmit = async e => {
+    e.preventDefault();
+    const fd = new FormData(f);
+    try {
+      await api('/api/requests', { method: 'POST', body: JSON.stringify({ kind: reqDraft.kind, name: fd.get('name') || '',
+        project: fd.get('project') || '', amount: Number(fd.get('amount') || 0), reason: fd.get('reason') }) });
+      await loadInbox(); render();
+      $('#req-msg').innerHTML = '<span class="muted">Request sent ✓ An admin will review it.</span>';
+    } catch (err) { $('#req-msg').innerHTML = `<span class="error">${esc(err.message)}</span>`; }
+  };
+  document.querySelectorAll('[data-decide]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try {
+      await api(`/api/requests/${b.dataset.id}/${b.dataset.decide}`, { method: 'POST',
+        body: JSON.stringify({ note: document.querySelector(`[data-note="${b.dataset.id}"]`).value }) });
+      [projects] = await Promise.all([api('/api/projects'), loadInbox()]);  // approvals can add projects or budget
+      render();
+    } catch (err) { b.disabled = false; alert(err.message); }
+  });
+}
+
+// ---------- feedback ----------
+function feedbackView() {
+  const admin = me.role === 'admin';
+  return `<h2>Feedback</h2>
+    <p class="muted">${admin ? 'What users told the platform team.' : 'Tell the platform team what works, what does not, and what you miss.'}</p>
+    ${admin ? '' : `<form class="card" id="fb-form">
+      <textarea name="message" rows="4" maxlength="2000" required aria-label="Your feedback" placeholder="Your feedback"></textarea>
+      <div class="row" style="margin:12px 0 0"><button>Send feedback</button><span id="fb-msg" role="status"></span></div></form>`}
+    <div class="card"><h3>${admin ? 'All feedback' : 'Sent by you'}</h3>
+      ${feedback.length ? feedback.map(f => `<div class="fb"><div class="muted">${admin ? esc(f.by) + ' · ' : ''}${esc(f.created.slice(0, 10))}</div>${esc(f.message)}</div>`).join('')
+        : '<p class="muted" style="margin:0">Nothing yet.</p>'}</div>`;
+}
+
+function bindFeedback() {
+  const f = $('#fb-form');
+  if (f) f.onsubmit = async e => {
+    e.preventDefault();
+    try {
+      await api('/api/feedback', { method: 'POST', body: JSON.stringify({ message: f.message.value }) });
+      await loadInbox(); render();
+      $('#fb-msg').innerHTML = '<span class="muted">Thanks, sent ✓</span>';
+    } catch (err) { $('#fb-msg').innerHTML = `<span class="error">${esc(err.message)}</span>`; }
+  };
 }
 
 // ---------- docs ----------
@@ -380,11 +510,12 @@ function docsView() {
 
     <h4>How it works</h4>
     <p>Your app calls one endpoint, served by LiteLLM on the gateway VM. Each request first goes through the guardrail
-    endpoint (secrets, blocklists, personal data), then LiteLLM routes it to an on-prem model or to Amazon Bedrock in an EU region.
+    endpoint (secrets, blocklists, personal data), then LiteLLM routes it to an on-prem model or to Amazon Bedrock
+    in <code>${esc(cfg.bedrock_region)}</code> (in-region models, data stays in that region).
     This is the only way out of the air-gapped network.</p>
 
     <h4>Get access</h4>
-    <ol><li>Ask an admin to create a project, or to add you as a member of an existing one.</li>
+    <ol><li>Request a project on the <b>Requests</b> page, or ask an admin to add you as a member of an existing one.</li>
       <li>Open the project in the sidebar and copy its endpoint and API key.</li>
       <li>Store the key in an environment variable, for example <code>GATEWAY_API_KEY</code>. Never commit it.</li></ol>
 
@@ -400,9 +531,15 @@ function docsView() {
     <h4>Budgets</h4>
     <p>Each project has a budget in USD. Every call is charged with the token counts reported by the model provider,
     at the prices shown on the project page. Cached input tokens (prompt caching on Bedrock) are charged at the lower cached price.
-    The cost of each call is returned in the <code>x-litellm-response-cost</code> response header.</p>
-    <p>When the budget is spent, calls are rejected until an admin raises it. The check runs before each call,
-    so the last call can go slightly over budget. Only admins can change budgets.</p>
+    The cost of each call is returned in the <code>x-litellm-response-cost</code> response header.
+    On-prem models are free and never use budget.</p>
+    <p>When the budget is spent, all calls of the project are rejected, on-prem ones included, until an admin raises it.
+    The check runs before each call, so the last call can go slightly over budget.
+    Only admins change budgets: use <b>Request budget increase</b> on the project page.</p>
+
+    <h4>Requests and feedback</h4>
+    <p>The <b>Requests</b> page lets you ask for a new project, a budget increase or a new model, and shows their status
+    and the admin's note. Use <b>Feedback</b> for anything else you want the platform team to know.</p>
 
     <h4>Errors</h4>
     <table><tr><th>Status</th><th>Code</th><th>Meaning</th></tr>
@@ -412,7 +549,11 @@ function docsView() {
 
     ${me.role === 'admin' ? `<h4>For admins</h4>
     <ul><li><b>New project</b> on the Overview page creates a project with its owner, members, budget and first API key.</li>
-      <li>On a project page you can change the budget, revoke the key (calls fail at once) or regenerate it (the old key stops working).</li></ul>` : ''}
+      <li>On a project page you can change the budget, revoke the key (calls fail at once) or regenerate it (the old key stops working).</li>
+      <li><b>Requests</b> shows pending requests first, with a count in the sidebar. Approving a project request creates it with the
+        requester as owner; approving a budget request adds the amount to the budget. A model request is only recorded:
+        add the model to LiteLLM's config yourself.</li>
+      <li><b>Feedback</b> lists everything users sent.</li></ul>` : ''}
   </div>`;
 }
 

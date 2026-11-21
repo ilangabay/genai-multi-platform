@@ -11,6 +11,8 @@ over HTTP with the master key in production (/team/new, /team/update, /team/info
 /key/generate, /key/delete, /model/info).
 """
 import json
+import logging
+import os
 import secrets
 import threading
 import uuid
@@ -18,26 +20,59 @@ import uuid
 from fastapi import APIRouter, Body, Header
 from fastapi.responses import JSONResponse
 
+from app import pricing
+
 M = 1_000_000
+ONPREM_API_BASE = os.environ.get("ONPREM_API_BASE", "http://onprem-llm.internal:8000/v1")
 
 
-def _model(name, platform, upstream, inp, out, cache_read=None, cache_write=None):
+def _model(name, platform, params, inp=0.0, out=0.0, cache_read=None, cache_write=None, aws_model=None):
     """Prices in USD per 1M tokens -> LiteLLM model_list entry (per-token costs)."""
     info = {"platform": platform, "input_cost_per_token": inp / M, "output_cost_per_token": out / M}
     if cache_read is not None:
         info |= {"cache_read_input_token_cost": cache_read / M, "cache_creation_input_token_cost": cache_write / M}
-    return {"model_name": name, "litellm_params": {"model": upstream}, "model_info": info}
+    if aws_model:
+        info["aws_model"] = aws_model  # model name in the AWS price file
+    return {"model_name": name, "litellm_params": params, "model_info": info}
 
 
-# Indicative prices. In production they come from the AWS Price List API (Bedrock, per region)
-# and from internal GPU chargeback (on-prem), loaded into LiteLLM's model config.
+def _bedrock(name, model_id, aws_model, *prices):
+    # regional (in-region) model IDs, not eu.* cross-region inference profiles
+    return _model(name, "Bedrock", {"model": f"bedrock/{model_id}", "aws_region_name": pricing.BEDROCK_REGION},
+                  *prices, aws_model=aws_model)
+
+
+# Bedrock: regional on-demand prices for eu-west-3 from the AWS price file of 2026-11-11, replaced at
+# startup when SYNC_PRICES=1. On-prem models are free: zero prices, so calls never touch the budget.
 MODEL_LIST = [
-    _model("claude-opus-5-5", "Bedrock", "bedrock/eu.anthropic.claude-opus-5-5", 4.0, 20.0, 0.4, 5.0),
-    _model("claude-sonnet-5-5", "Bedrock", "bedrock/eu.anthropic.claude-sonnet-5-5", 2.0, 10.0, 0.2, 2.5),
-    _model("claude-haiku-5-5", "Bedrock", "bedrock/eu.anthropic.claude-haiku-5-5", 0.1, 0.5, 0.01, 0.125),
-    _model("mistral-small-onprem", "On-prem", "hosted_vllm/mistral-small", 0.05, 0.15),
-    _model("llama-70b-onprem", "On-prem", "hosted_vllm/llama-3.3-70b", 0.2, 0.6),
+    _bedrock("claude-opus-5-5", "anthropic.claude-opus-5-5", "Claude Opus 5.5", 4.4, 22.0, 0.22, 5.5),
+    _bedrock("claude-sonnet-5-5", "anthropic.claude-sonnet-5-5", "Claude Sonnet 5.5", 2.2, 11.0, 0.11, 2.75),
+    _bedrock("claude-haiku-5-5", "anthropic.claude-haiku-5-5", "Claude Haiku 5.5", 0.11, 0.55, 0.011, 0.1375),
+    _model("mistral-small-onprem", "On-prem", {"model": "hosted_vllm/mistral-small", "api_base": ONPREM_API_BASE}),
+    _model("llama-70b-onprem", "On-prem", {"model": "hosted_vllm/llama-3.3-70b", "api_base": ONPREM_API_BASE}),
 ]
+
+
+def sync_prices(prices: dict[str, dict]) -> list[str]:
+    """Load AWS prices (USD per 1M tokens, from app.pricing) into the model config. Returns the models updated.
+    Production: the same job calls LiteLLM's /model/update instead."""
+    fields = {"input": "input_cost_per_token", "output": "output_cost_per_token",
+              "cache_read": "cache_read_input_token_cost", "cache_write": "cache_creation_input_token_cost"}
+    updated = []
+    for m in MODEL_LIST:
+        p = prices.get(m["model_info"].get("aws_model"), {})
+        if {"input", "output"} <= p.keys():  # skip models missing from the price file, keep their old prices
+            m["model_info"] |= {fields[k]: v / M for k, v in p.items() if k in fields}
+            updated.append(m["model_name"])
+    return updated
+
+
+if os.environ.get("SYNC_PRICES") == "1":
+    try:
+        logging.getLogger(__name__).warning("Bedrock prices synced for %s", sync_prices(pricing.fetch()))
+    except (OSError, ValueError) as e:  # keep serving with the built-in prices
+        logging.getLogger(__name__).error("Price sync failed, using built-in prices: %s", e)
+
 MODELS = {m["model_name"]: m for m in MODEL_LIST}
 
 TEAMS: dict[str, dict] = {}  # team_id -> {team_alias, max_budget, spend}
