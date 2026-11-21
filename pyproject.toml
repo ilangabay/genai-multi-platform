@@ -1,0 +1,19 @@
+[project]
+name = "genai-multi-platform"
+version = "0.1.0"
+description = "Governance layer of the GenAI gateway VM (mock)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.165.0",
+    "uvicorn>=0.54.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.16.2",
+    "pytest>=9.2.0",
+]

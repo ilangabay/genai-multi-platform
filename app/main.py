@@ -2,10 +2,13 @@
 
 Serves the web UI, the project/admin API and a mock OpenAI-compatible
 /v1/chat/completions that charges the project budget. No real LLM is called.
+In production, apps call the guardrail LiteLLM endpoint, which forwards to the
+LiteLLM router serving Bedrock and on-prem models; this mock stands in for both.
 """
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 from pathlib import Path
@@ -16,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
 USER_PASSWORD = os.environ.get("USER_PASSWORD", "user")
-GATEWAY_URL = os.environ.get("GATEWAY_URL")  # public base URL shown to users; defaults to this server
+LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL")  # guardrail LiteLLM endpoint shown to users; defaults to this mock
 STATIC = Path(__file__).parent / "static"
 
 # shortcut: in-memory mock store, reset on restart; move to PostgreSQL (NUMERIC for money) for real use.
@@ -73,14 +76,11 @@ def admin_only(user: dict = Depends(current_user)) -> dict:
 
 
 @app.post("/api/login")
-def login(response: Response, username: str = Body(...), password: str = Body(...)):
-    username = username.strip().lower()
-    if hmac.compare_digest(password, ADMIN_PASSWORD):
-        role = "admin"
-    elif hmac.compare_digest(password, USER_PASSWORD) and username in USERS:
-        role = "user"
-    else:
-        raise HTTPException(401, "Invalid username or password")
+def login(response: Response, role: str = Body(...), password: str = Body(...), username: str = Body("")):
+    username = "admin" if role == "admin" else username.strip().lower()
+    ok = {"admin": ADMIN_PASSWORD, "user": USER_PASSWORD}.get(role)
+    if not ok or not hmac.compare_digest(password, ok) or (role == "user" and username not in USERS):
+        raise HTTPException(401, "Invalid credentials")
     token = secrets.token_urlsafe(32)
     SESSIONS[token] = {"username": username, "role": role}
     response.set_cookie("session", token, httponly=True, samesite="strict")
@@ -113,13 +113,36 @@ def get_project(pid: str) -> dict:
 
 @app.get("/api/projects")
 def list_projects(request: Request, user: dict = Depends(current_user)):
-    endpoint = GATEWAY_URL or str(request.base_url).rstrip("/") + "/v1"
+    endpoint = LITELLM_BASE_URL or str(request.base_url).rstrip("/") + "/v1"
     return [{**p, "endpoint": endpoint} for p in PROJECTS.values() if visible(p, user)]
 
 
 @app.get("/api/models")
 def list_models(user: dict = Depends(current_user)):
     return MODELS
+
+
+@app.get("/api/users")
+def list_users(user: dict = Depends(admin_only)):
+    return sorted(USERS)
+
+
+@app.post("/api/projects", status_code=201)
+def create_project(name: str = Body(...), owner: str = Body(...), members: list[str] = Body([]),
+                   budget: float = Body(...), user: dict = Depends(admin_only)):
+    name = name.strip()
+    pid = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if not pid:
+        raise HTTPException(422, "Project name is required")
+    if pid in PROJECTS:
+        raise HTTPException(409, "A project with this name already exists")
+    if owner not in USERS or not set(members) <= USERS:
+        raise HTTPException(422, "Unknown owner or member")
+    if not budget >= 0:
+        raise HTTPException(422, "Budget must be a positive number")
+    PROJECTS[pid] = {"id": pid, "name": name, "owner": owner, "members": sorted(set(members) - {owner}),
+                     "budget": budget, "spent": 0.0, "api_key": new_key()}
+    return PROJECTS[pid]
 
 
 @app.patch("/api/projects/{pid}/budget")

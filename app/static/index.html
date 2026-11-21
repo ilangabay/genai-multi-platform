@@ -12,16 +12,19 @@
   button { border: 1px solid var(--blue); background: var(--blue); color: #fff; border-radius: 6px; padding: 6px 12px; cursor: pointer; }
   button.ghost { background: #fff; color: var(--blue); }
   button.danger { background: #fff; color: var(--red); border-color: var(--red); }
+  button.link { border: 0; background: none; color: var(--blue); padding: 0; }
   input, select { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
-  input:focus, select:focus, button:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  input:focus, select:focus, button:focus-visible, summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
   code { font: 13px ui-monospace, Consolas, monospace; background: var(--blue-soft); padding: 3px 6px; border-radius: 4px; word-break: break-all; }
+  pre { font: 13px/1.5 ui-monospace, Consolas, monospace; background: var(--blue-soft); padding: 12px 14px; border-radius: 6px; overflow-x: auto; margin: 0; }
   .hidden { display: none !important; }
   .muted { color: var(--muted); }
   .error { color: var(--red); }
 
-  #login { min-height: 100vh; display: grid; place-items: center; background: var(--blue-soft); }
-  #login form { background: #fff; padding: 32px; border-radius: 12px; width: 320px; display: grid; gap: 12px; box-shadow: 0 4px 24px #1d4ed814; }
-  #login h1 { margin: 0 0 4px; font-size: 20px; color: var(--blue); }
+  #login { min-height: 100vh; display: grid; place-items: center; background: var(--blue-soft); padding: 16px; }
+  #login .box { background: #fff; padding: 32px; border-radius: 12px; width: 100%; max-width: 340px; display: grid; gap: 12px; box-shadow: 0 4px 24px #1d4ed814; }
+  #login h1 { margin: 0; font-size: 20px; color: var(--blue); }
+  #login form { display: grid; gap: 12px; }
 
   #app { display: flex; min-height: 100vh; }
   nav { width: 220px; flex-shrink: 0; background: var(--blue); color: #fff; display: flex; flex-direction: column; padding: 20px 12px; }
@@ -32,9 +35,11 @@
   nav .foot { margin-top: auto; padding: 10px; font-size: 13px; color: #dbe5ff; }
   nav .foot button { margin-top: 8px; width: 100%; background: transparent; border-color: #ffffff55; }
 
-  main { flex: 1; padding: 32px 40px; max-width: 900px; }
+  main { flex: 1; padding: 32px 40px; max-width: 900px; min-width: 0; }
   h2 { margin: 0 0 4px; font-size: 22px; }
   h3 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: .05em; }
+  h4 { margin: 24px 0 8px; font-size: 15px; }
+  .head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
   .card { border: 1px solid var(--line); border-radius: 10px; padding: 20px; margin-top: 20px; }
   .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
   .row .label { width: 80px; color: var(--muted); }
@@ -46,21 +51,40 @@
   th { color: var(--muted); font-weight: 500; font-size: 13px; }
   tr.click { cursor: pointer; } tr.click:hover { background: var(--blue-soft); }
   .pill { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--blue-soft); color: var(--blue); }
+  details { border-bottom: 1px solid var(--line); }
+  summary { display: flex; align-items: center; gap: 12px; padding: 10px 6px; cursor: pointer; list-style: none; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: "›"; color: var(--muted); transition: transform .15s; }
+  details[open] summary::before { transform: rotate(90deg); }
+  summary .price { margin-left: auto; color: var(--muted); font-size: 13px; }
+  details .sample { padding: 0 6px 14px; display: grid; gap: 8px; }
+  .seg button { padding: 3px 10px; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: 90px 1fr; gap: 10px 12px; align-items: center; }
+  .checks { display: flex; gap: 14px; flex-wrap: wrap; }
+  .docs p, .docs li { max-width: 680px; }
 
-  @media (max-width: 700px) { #app { flex-direction: column; } nav { width: auto; } main { padding: 20px 16px; } }
+  @media (max-width: 700px) { #app { flex-direction: column; } nav { width: auto; } main { padding: 20px 16px; } summary .price { display: none; } }
 </style>
 </head>
 <body>
 
 <div id="login" class="hidden">
-  <form id="login-form">
+  <div class="box">
     <h1>GenAI Gateway</h1>
-    <span class="muted">Sign in to your projects</span>
-    <input name="username" placeholder="Username" autocomplete="username" required aria-label="Username">
-    <input name="password" type="password" placeholder="Password" autocomplete="current-password" required aria-label="Password">
-    <button>Sign in</button>
-    <span id="login-error" class="error" role="alert"></span>
-  </form>
+    <div id="pick-role" style="display:grid;gap:10px">
+      <span class="muted">Choose how to sign in</span>
+      <button data-role="user">Sign in as user</button>
+      <button data-role="admin" class="ghost">Sign in as admin</button>
+    </div>
+    <form id="login-form" class="hidden">
+      <span id="login-title" class="muted"></span>
+      <input name="username" placeholder="Username" autocomplete="username" aria-label="Username">
+      <input name="password" type="password" placeholder="Password" autocomplete="current-password" required aria-label="Password">
+      <button>Sign in</button>
+      <button type="button" class="link" id="back">← Back</button>
+      <span id="login-error" class="error" role="alert"></span>
+    </form>
+  </div>
 </div>
 
 <div id="app" class="hidden">
@@ -69,6 +93,8 @@
     <a href="#" data-view="overview">Overview</a>
     <div class="section">Projects</div>
     <div id="nav-projects"></div>
+    <div class="section">Help</div>
+    <a href="#" data-view="docs">Documentation</a>
     <div class="foot"><div id="whoami"></div><button id="logout">Sign out</button></div>
   </nav>
   <main id="main"></main>
@@ -78,49 +104,73 @@
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const usd = n => '$' + Number(n).toFixed(n < 1 ? 4 : 2);
-let me, projects = [], models = [], current = null, showKey = false;
+let me, projects = [], models = [], users = [], view = 'overview', showKey = false, creating = false, lang = 'curl', loginRole;
 
 async function api(path, opts = {}) {
   const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.detail || data.error?.message || r.statusText);
+  if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : data.error?.message || r.statusText);
   return data;
 }
 
+// ---------- login ----------
 async function boot() {
   try { me = await api('/api/me'); } catch { return showLogin(); }
   [projects, models] = await Promise.all([api('/api/projects'), api('/api/models')]);
+  users = me.role === 'admin' ? await api('/api/users') : [];
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
   $('#whoami').textContent = `${me.username} · ${me.role}`;
   render();
 }
 
-function showLogin() { $('#app').classList.add('hidden'); $('#login').classList.remove('hidden'); }
+function showLogin() {
+  $('#app').classList.add('hidden'); $('#login').classList.remove('hidden');
+  $('#pick-role').classList.remove('hidden'); $('#login-form').classList.add('hidden');
+}
 
+$('#pick-role').onclick = e => {
+  const b = e.target.closest('[data-role]'); if (!b) return;
+  loginRole = b.dataset.role;
+  const user = loginRole === 'user', f = $('#login-form');
+  $('#login-title').textContent = user ? 'Sign in as user' : 'Sign in as admin';
+  f.username.classList.toggle('hidden', !user); f.username.required = user;
+  $('#pick-role').classList.add('hidden'); f.classList.remove('hidden');
+  (user ? f.username : f.password).focus();
+};
+$('#back').onclick = () => { $('#login-error').textContent = ''; showLogin(); };
 $('#login-form').onsubmit = async e => {
   e.preventDefault();
-  const f = new FormData(e.target);
+  const f = e.target;
   try {
-    await api('/api/login', { method: 'POST', body: JSON.stringify(Object.fromEntries(f)) });
-    $('#login-error').textContent = ''; e.target.reset(); boot();
+    await api('/api/login', { method: 'POST', body: JSON.stringify({ role: loginRole, username: f.username.value, password: f.password.value }) });
+    $('#login-error').textContent = ''; f.reset(); boot();
   } catch (err) { $('#login-error').textContent = err.message; }
 };
-$('#logout').onclick = async () => { await api('/api/logout', { method: 'POST' }); current = null; showLogin(); };
+$('#logout').onclick = async () => { await api('/api/logout', { method: 'POST' }); view = 'overview'; showLogin(); };
+
+// ---------- navigation ----------
 document.querySelector('nav').onclick = e => {
   const a = e.target.closest('a'); if (!a) return;
-  e.preventDefault(); current = a.dataset.project || null; showKey = false; render();
+  e.preventDefault(); view = a.dataset.project || a.dataset.view; showKey = false; creating = false; render(); scrollTo(0, 0);
 };
+$('#main').addEventListener('click', e => {
+  const row = e.target.closest('[data-open]');
+  if (row) { view = row.dataset.open; render(); }
+  const c = e.target.closest('[data-copy]');
+  if (c) navigator.clipboard.writeText(c.dataset.copy);
+});
 
 async function refresh() { projects = await api('/api/projects'); render(); }
 
 function render() {
   $('#nav-projects').innerHTML = projects.map(p =>
-    `<a href="#" data-project="${esc(p.id)}" class="${p.id === current ? 'active' : ''}">${esc(p.name)}</a>`).join('');
-  document.querySelector('[data-view=overview]').classList.toggle('active', !current);
-  const p = projects.find(p => p.id === current);
-  $('#main').innerHTML = p ? projectView(p) : overview();
+    `<a href="#" data-project="${esc(p.id)}" class="${p.id === view ? 'active' : ''}">${esc(p.name)}</a>`).join('');
+  document.querySelectorAll('[data-view]').forEach(a => a.classList.toggle('active', a.dataset.view === view));
+  const p = projects.find(p => p.id === view);
+  $('#main').innerHTML = p ? projectView(p) : view === 'docs' ? docsView() : overview();
   if (p) bindProject(p);
+  if (view === 'overview' && creating) bindCreate();
 }
 
 function bar(p) {
@@ -128,9 +178,13 @@ function bar(p) {
   return `<div class="bar ${pct >= 100 ? 'full' : ''}"><div style="width:${pct}%"></div></div>`;
 }
 
+// ---------- overview ----------
 function overview() {
-  return `<h2>${me.role === 'admin' ? 'All projects' : 'My projects'}</h2>
+  const admin = me.role === 'admin';
+  return `<div class="head"><h2>${admin ? 'All projects' : 'My projects'}</h2>
+      ${admin && !creating ? '<button id="new-project">New project</button>' : ''}</div>
     <p class="muted">${projects.length} project${projects.length === 1 ? '' : 's'}</p>
+    ${creating ? createForm() : ''}
     <div class="card"><table>
       <tr><th>Project</th><th>Owner</th><th>Spent</th><th>Budget</th><th style="width:30%">Usage</th></tr>
       ${projects.map(p => `<tr class="click" data-open="${esc(p.id)}">
@@ -138,10 +192,53 @@ function overview() {
     </table></div>`;
 }
 
-$('#main').addEventListener('click', e => {
-  const row = e.target.closest('[data-open]');
-  if (row) { current = row.dataset.open; render(); }
-});
+function createForm() {
+  return `<form class="card" id="create-form"><h3>New project</h3>
+    <div class="grid">
+      <label for="np-name">Name</label><input id="np-name" name="name" required>
+      <label for="np-owner">Owner</label><select id="np-owner" name="owner">${users.map(u => `<option>${esc(u)}</option>`).join('')}</select>
+      <span>Members</span><div class="checks">${users.map(u =>
+        `<label><input type="checkbox" name="members" value="${esc(u)}"> ${esc(u)}</label>`).join('')}</div>
+      <label for="np-budget">Budget $</label><input id="np-budget" name="budget" type="number" min="0" step="0.01" value="100" required style="width:140px">
+    </div>
+    <div class="row" style="margin:16px 0 0"><button>Create</button><button type="button" class="ghost" id="cancel-create">Cancel</button>
+      <span id="create-error" class="error" role="alert"></span></div>
+  </form>`;
+}
+
+function bindCreate() {
+  const f = $('#create-form');
+  f.name.focus();
+  $('#cancel-create').onclick = () => { creating = false; render(); };
+  f.onsubmit = async e => {
+    e.preventDefault();
+    const fd = new FormData(f);
+    try {
+      const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({
+        name: fd.get('name'), owner: fd.get('owner'), members: fd.getAll('members'), budget: Number(fd.get('budget')) }) });
+      creating = false; view = p.id; refresh();
+    } catch (err) { $('#create-error').textContent = err.message; }
+  };
+}
+
+document.addEventListener('click', e => { if (e.target.id === 'new-project') { creating = true; render(); } });
+
+// ---------- project ----------
+function sample(endpoint, model) {
+  if (lang === 'python') return `import os
+from openai import OpenAI
+
+client = OpenAI(base_url="${endpoint}", api_key=os.environ["GATEWAY_API_KEY"])
+resp = client.chat.completions.create(
+    model="${model}",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(resp.choices[0].message.content)`;
+  return `curl ${endpoint}/chat/completions \\
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "${model}", "messages": [{"role": "user", "content": "Hello"}]}'`;
+}
 
 function projectView(p) {
   const admin = me.role === 'admin';
@@ -171,24 +268,22 @@ function projectView(p) {
         <button class="ghost" id="regen">${p.api_key ? 'Regenerate key' : 'Create new key'}</button></div>` : ''}
     </div>
 
-    <div class="card"><h3>Models</h3>
-      <table><tr><th>Model</th><th>Platform</th><th>Input / 1M tok</th><th>Output / 1M tok</th></tr>
-      ${models.map(m => `<tr><td><code>${esc(m.id)}</code></td><td><span class="pill">${esc(m.platform)}</span></td>
-        <td>$${m.input.toFixed(2)}</td><td>$${m.output.toFixed(2)}</td></tr>`).join('')}</table>
-    </div>
-
-    <div class="card"><h3>Test call</h3>
-      <div class="row">
-        <select id="test-model" aria-label="Model">${models.map(m => `<option>${esc(m.id)}</option>`).join('')}</select>
-        <button id="test">Send mock request</button>
-      </div>
-      <div id="test-result" role="status"></div>
+    <div class="card"><div class="head"><h3>Models</h3>
+        <div class="seg" role="group" aria-label="Sample language">
+          <button class="${lang === 'curl' ? '' : 'ghost'}" data-lang="curl">curl</button>
+          <button class="${lang === 'python' ? '' : 'ghost'}" data-lang="python">Python</button></div></div>
+      <p class="muted" style="margin:0 0 8px">Open a model to see a sample request. Set <code>GATEWAY_API_KEY</code> to this project's key first.</p>
+      ${models.map(m => `<details><summary><code>${esc(m.id)}</code><span class="pill">${esc(m.platform)}</span>
+          <span class="price">$${m.input.toFixed(2)} in · $${m.output.toFixed(2)} out / 1M tokens</span></summary>
+        <div class="sample"><pre>${esc(sample(p.endpoint, m.id))}</pre>
+          <div><button class="ghost" data-copy="${esc(sample(p.endpoint, m.id))}">Copy</button>
+          <button class="ghost" data-try="${esc(m.id)}">Send mock request</button>
+          <span class="try-result" role="status"></span></div></div></details>`).join('')}
     </div>`;
 }
 
 function bindProject(p) {
   const on = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
-  document.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => navigator.clipboard.writeText(b.dataset.copy));
   on('toggle-key', () => { showKey = !showKey; render(); });
   on('save-budget', async () => {
     await api(`/api/projects/${p.id}/budget`, { method: 'PATCH', body: JSON.stringify({ budget: Number($('#budget').value) }) });
@@ -204,22 +299,63 @@ function bindProject(p) {
       await api(`/api/projects/${p.id}/key/regenerate`, { method: 'POST' }); refresh();
     }
   });
-  on('test', async () => {
-    const out = $('#test-result');
-    if (!p.api_key) { out.innerHTML = '<span class="error">No active API key.</span>'; return; }
-    const r = await fetch(p.endpoint + '/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + p.api_key },
-      body: JSON.stringify({ model: $('#test-model').value, messages: [{ role: 'user', content: 'Hello' }] }),
-    });
-    const d = await r.json();
-    const model = $('#test-model').value;
-    await refresh();
-    $('#test-model').value = model;
-    $('#test-result').innerHTML = r.ok
-      ? `<span>${esc(d.choices[0].message.content)}</span><br><span class="muted">Cost ${usd(d.x_cost_usd)} · ${usd(d.x_budget_remaining_usd)} left</span>`
-      : `<span class="error">${r.status} · ${esc(d.error.message)}</span>`;
+  document.querySelectorAll('[data-lang]').forEach(b => b.onclick = () => { lang = b.dataset.lang; render(); });
+  document.querySelectorAll('[data-try]').forEach(b => b.onclick = async () => {
+    const model = b.dataset.try;
+    let msg;
+    if (!p.api_key) msg = '<span class="error">No active API key.</span>';
+    else {
+      const r = await fetch(p.endpoint + '/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + p.api_key },
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Hello' }] }),
+      });
+      const d = await r.json();
+      msg = r.ok ? `<span class="muted">${esc(d.choices[0].message.content)} Cost ${usd(d.x_cost_usd)} · ${usd(d.x_budget_remaining_usd)} left</span>`
+                 : `<span class="error">${r.status} · ${esc(d.error.message)}</span>`;
+      await refresh();
+    }
+    const det = [...document.querySelectorAll('[data-try]')].find(x => x.dataset.try === model).closest('details');
+    det.open = true;
+    det.querySelector('.try-result').innerHTML = msg;
   });
+}
+
+// ---------- docs ----------
+function docsView() {
+  const ep = projects[0]?.endpoint || location.origin + '/v1';
+  return `<div class="docs"><h2>Documentation</h2>
+    <p class="muted">How to call LLMs from the air-gapped network through the gateway.</p>
+
+    <h4>How it works</h4>
+    <p>Your app calls one endpoint, served by LiteLLM on the gateway VM. Each request first goes through the guardrail
+    endpoint (secrets, blocklists, personal data), then LiteLLM routes it to an on-prem model or to Amazon Bedrock in an EU region.
+    This is the only way out of the air-gapped network.</p>
+
+    <h4>Get access</h4>
+    <ol><li>Ask an admin to create a project, or to add you as a member of an existing one.</li>
+      <li>Open the project in the sidebar and copy its endpoint and API key.</li>
+      <li>Store the key in an environment variable, for example <code>GATEWAY_API_KEY</code>. Never commit it.</li></ol>
+
+    <h4>Call a model</h4>
+    <p>The API is OpenAI-compatible: any OpenAI SDK or tool works by changing its base URL. Use the model names listed in your project.</p>
+    <pre>${esc(sample(ep, 'claude-sonnet-5-5'))}</pre>
+    <p>LiteLLM also accepts Anthropic-format requests on <code>/v1/messages</code>, for tools that use the Anthropic SDK.</p>
+
+    <h4>Budgets</h4>
+    <p>Each project has a budget in USD. Every call is charged by tokens used, at the prices shown on the project page.
+    When the budget is spent, calls are rejected until an admin raises it. Only admins can change budgets.</p>
+
+    <h4>Errors</h4>
+    <table><tr><th>Status</th><th>Code</th><th>Meaning</th></tr>
+      <tr><td>401</td><td><code>invalid_api_key</code></td><td>Key is wrong or was revoked. Get the current key from the project page.</td></tr>
+      <tr><td>402</td><td><code>budget_exceeded</code></td><td>The project budget is spent. Ask an admin to raise it.</td></tr>
+      <tr><td>404</td><td><code>model_not_found</code></td><td>The model name is not in the catalog.</td></tr></table>
+
+    ${me.role === 'admin' ? `<h4>For admins</h4>
+    <ul><li><b>New project</b> on the Overview page creates a project with its owner, members, budget and first API key.</li>
+      <li>On a project page you can change the budget, revoke the key (calls fail at once) or regenerate it (the old key stops working).</li></ul>` : ''}
+  </div>`;
 }
 
 boot();
