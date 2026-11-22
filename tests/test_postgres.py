@@ -31,10 +31,11 @@ def db_url():
 FIRST_START = '''
 from fastapi.testclient import TestClient
 from app import main
+main.startup()
 assert set(main.USERS) == {"admin"} and not main.PROJECTS  # no demo data with a database
 c = TestClient(main.app)
-assert c.post("/api/login", json={"role": "admin", "username": "admin", "password": "first-pass"}).json()["must_change_password"]
-assert c.post("/api/me/password", json={"current": "first-pass", "new": "a-long-admin-password"}).status_code == 200
+assert c.post("/api/login", json={"role": "admin", "username": "admin", "password": "first-password-long"}).json()["must_change_password"]
+assert c.post("/api/me/password", json={"current": "first-password-long", "new": "a-long-admin-password"}).status_code == 200
 assert c.post("/api/users", json={"username": "dave"}).status_code == 201
 p = c.post("/api/projects", json={"name": "Persisted", "owner": "dave", "budget": 3}).json()
 assert c.put("/api/projects/persisted/models", json={"models": ["claude-haiku-5-5"]}).status_code == 200
@@ -49,6 +50,7 @@ SECOND_START = '''
 import sys
 from fastapi.testclient import TestClient
 from app import main
+main.startup()
 token, key = sys.argv[1:]
 assert set(main.USERS) == {"admin", "dave"} and list(main.PROJECTS) == ["persisted"]
 assert main.check_password("a-long-admin-password", main.USERS["admin"]["password"])
@@ -65,7 +67,7 @@ assert r.status_code == 401  # the model list survived too
 
 
 def start(code: str, url: str, *args: str) -> str:
-    env = {**os.environ, "STORAGE": "postgres", "DATABASE_URL": url, "ADMIN_PASSWORD": "first-pass"}
+    env = {**os.environ, "STORAGE": "postgres", "DATABASE_URL": url, "ADMIN_PASSWORD": "first-password-long"}
     r = subprocess.run([sys.executable, "-c", code, *args], env=env, cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr
     return r.stdout.strip()

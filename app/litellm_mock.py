@@ -22,8 +22,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Body, Header
 from fastapi.responses import JSONResponse
 
-from app import pricing
-from app.store import STORE
+from app import pricing, store
 
 M = 1_000_000
 ONPREM_API_BASE = os.environ.get("ONPREM_API_BASE", "http://onprem-llm.internal:8000/v1")
@@ -70,19 +69,26 @@ def sync_prices(prices: dict[str, dict]) -> list[str]:
     return updated
 
 
-if os.environ.get("SYNC_PRICES") == "1":
-    try:
-        logging.getLogger(__name__).warning("Bedrock prices synced for %s", sync_prices(pricing.fetch()))
-    except (OSError, ValueError) as e:  # keep serving with the built-in prices
-        logging.getLogger(__name__).error("Price sync failed, using built-in prices: %s", e)
-
 MODELS = {m["model_name"]: m for m in MODEL_LIST}
 
-TEAMS: dict[str, dict] = STORE.load("litellm_mock_teams")  # team_id -> {team_alias, max_budget, spend, models}
-KEYS: dict[str, str] = {k: v["team_id"] for k, v in STORE.load("litellm_mock_keys").items()}  # virtual key -> team_id
-# one row per call, like LiteLLM_SpendLogs
-SPEND_LOGS: list[dict] = sorted(STORE.load("litellm_mock_spend_logs").values(), key=lambda r: r["startTime"])
+TEAMS: dict[str, dict] = {}  # team_id -> {team_alias, max_budget, spend, models}
+KEYS: dict[str, str] = {}    # virtual key -> team_id
+SPEND_LOGS: list[dict] = []  # one row per call, like LiteLLM_SpendLogs. Memory mode only: with a database, queried by date
 LOCK = threading.Lock()
+
+
+def startup():
+    """Load state from the store; called by the app at startup (main.startup)."""
+    if os.environ.get("SYNC_PRICES") == "1":
+        try:
+            logging.getLogger(__name__).warning("Bedrock prices synced for %s", sync_prices(pricing.fetch()))
+        except (OSError, ValueError) as e:  # keep serving with the built-in prices
+            logging.getLogger(__name__).error("Price sync failed, using built-in prices: %s", e)
+    TEAMS.clear()
+    TEAMS.update(store.STORE.load("litellm_mock_teams"))
+    KEYS.clear()
+    KEYS.update({k: v["team_id"] for k, v in store.STORE.load("litellm_mock_keys").items()})
+    SPEND_LOGS.clear()
 
 
 # ---------- admin API (called by the governance layer) ----------
@@ -94,20 +100,16 @@ def model_info() -> list[dict]:
 def team_new(team_alias: str, max_budget: float, models: list[str]) -> dict:
     """models: the team's allowed model names. Like LiteLLM, an empty list means every model."""
     team_id = str(uuid.uuid4())
-    TEAMS[team_id] = {"team_id": team_id, "team_alias": team_alias, "max_budget": max_budget, "spend": 0.0,
-                      "models": list(models)}
-    STORE.save("litellm_mock_teams", team_id, TEAMS[team_id])
-    return TEAMS[team_id]
+    team = {"team_id": team_id, "team_alias": team_alias, "max_budget": max_budget, "spend": 0.0, "models": list(models)}
+    store.STORE.save("litellm_mock_teams", team_id, team)
+    TEAMS[team_id] = team
+    return team
 
 
 def team_update(team_id: str, max_budget: float | None = None, models: list[str] | None = None) -> dict:
+    changes = {k: v for k, v in (("max_budget", max_budget), ("models", models and list(models))) if v is not None}
     with LOCK:
-        if max_budget is not None:
-            TEAMS[team_id]["max_budget"] = max_budget
-        if models is not None:
-            TEAMS[team_id]["models"] = list(models)
-        STORE.save("litellm_mock_teams", team_id, TEAMS[team_id])
-    return TEAMS[team_id]
+        return store.update("litellm_mock_teams", team_id, TEAMS[team_id], **changes)
 
 
 def team_info(team_id: str) -> dict:
@@ -116,13 +118,15 @@ def team_info(team_id: str) -> dict:
 
 def key_generate(team_id: str) -> dict:
     key = "sk-" + secrets.token_urlsafe(24)
+    store.STORE.save("litellm_mock_keys", key, {"team_id": team_id})
     KEYS[key] = team_id
-    STORE.save("litellm_mock_keys", key, {"team_id": team_id})
     return {"key": key, "team_id": team_id}
 
 
 def spend_logs(start_date: str) -> list[dict]:
     """Rows since start_date (YYYY-MM-DD, UTC). Production: LiteLLM's /spend/logs, or a query on its spend tables."""
+    if store.STORE.persistent:
+        return store.STORE.since("litellm_mock_spend_logs", "startTime", start_date)
     return [r for r in SPEND_LOGS if r["startTime"][:10] >= start_date]
 
 
@@ -147,17 +151,17 @@ def seed_history(team_id: str, total_spend: float, days: int = 90, seed: int = 0
         if raw and r["spend"]:
             r["spend"] *= total_spend / raw
             r["total_tokens"] = int(r["total_tokens"] * total_spend / raw)
-    SPEND_LOGS.extend(rows)
-    TEAMS[team_id]["spend"] = sum(r["spend"] for r in rows) if raw else total_spend
     for r in rows:
-        STORE.save("litellm_mock_spend_logs", r["id"], r)
-    STORE.save("litellm_mock_teams", team_id, TEAMS[team_id])
+        store.STORE.save("litellm_mock_spend_logs", r["id"], r)
+    if not store.STORE.persistent:
+        SPEND_LOGS.extend(rows)
+    store.update("litellm_mock_teams", team_id, TEAMS[team_id], spend=sum(r["spend"] for r in rows) if raw else total_spend)
 
 
 def key_delete(keys: list[str]) -> dict:
     for k in keys:
+        store.STORE.delete("litellm_mock_keys", k)
         KEYS.pop(k, None)
-        STORE.delete("litellm_mock_keys", k)
     return {"deleted_keys": keys}
 
 
@@ -203,11 +207,11 @@ def _call(authorization: str, model_name, payload):
     cost = _cost(model["model_info"], usage)
     log = {"id": uuid.uuid4().hex, "startTime": datetime.now(timezone.utc).isoformat(timespec="seconds"),
            "team_id": team_id, "model_group": model_name, "spend": cost, "total_tokens": sum(usage.values())}
-    with LOCK:
-        team["spend"] += cost
-        SPEND_LOGS.append(log)
-        STORE.save("litellm_mock_teams", team_id, team)
-        STORE.save("litellm_mock_spend_logs", log["id"], log)
+    with LOCK:  # spend first: if the log write fails, the budget is still right and only the chart misses a call
+        store.update("litellm_mock_teams", team_id, team, spend=team["spend"] + cost)
+        store.STORE.save("litellm_mock_spend_logs", log["id"], log)
+        if not store.STORE.persistent:
+            SPEND_LOGS.append(log)
     return model, usage, cost
 
 

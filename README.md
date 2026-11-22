@@ -37,7 +37,9 @@ Configuration is by environment variables. Copy `.env.example` to `.env` (gitign
 |--------------------------|-------------------------------------------|----------------------------------------------------------------|
 | `STORAGE`                | `memory`                                  | `memory` (local, nothing kept) or `postgres` (deployments)     |
 | `DATABASE_URL`           | none                                      | Required with `postgres`: `postgresql://user:password@host:5432/db` |
-| `ADMIN_PASSWORD`         | `admin`                                   | First password of the bootstrap admin account `admin`          |
+| `ADMIN_PASSWORD`         | `admin`                                   | First password of the bootstrap admin account `admin`; with `postgres`, 12+ characters and not a default |
+| `SESSION_HOURS`          | `12`                                      | Sign-ins expire after this many hours                          |
+| `COOKIE_SECURE`          | `0`                                       | `1` sends the session cookie over HTTPS only (behind TLS)      |
 | `USER_PASSWORD`          | `user`                                    | First password of the `GATEWAY_USERS` demo accounts            |
 | `GATEWAY_USERS`          | `alice,bob,carol`                         | Demo user accounts created at startup                          |
 | `LITELLM_BASE_URL`       | `<this server>/v1`                        | Guardrail LiteLLM endpoint shown to users                      |
@@ -122,7 +124,7 @@ The `Demo sandbox` project (owner `alice`) has a $0.02 budget so you hit the lim
 | `STORAGE`  | Use                 | Behaviour |
 |------------|---------------------|-----------|
 | `memory`   | Local runs, tests   | Nothing is persisted. Demo users, projects and 90 days of usage are created at every start. |
-| `postgres` | Deployments         | Every change is written to PostgreSQL and loaded back at startup. No demo data: only the account `admin` is created on the first start, with `ADMIN_PASSWORD`, which must be changed at first sign-in. |
+| `postgres` | Deployments         | Every change is written to PostgreSQL and loaded back at startup. No demo data: only the account `admin` is created on the first start, with `ADMIN_PASSWORD` (12+ characters, defaults refused), which must be changed at first sign-in. |
 
 `postgres` needs `DATABASE_URL` (user and password included); the app refuses to start without it, or if the
 database cannot be reached within 15 seconds. Tables are created on first start, one per kind of record:
@@ -131,7 +133,9 @@ database cannot be reached within 15 seconds. Tables are created on first start,
 Each row is `(id, data jsonb, updated_at)`. Passwords are scrypt hashes and session tokens are stored as SHA-256 hashes.
 
 Run **one process** (`uvicorn` without `--workers`): the app keeps the data in memory and writes each change
-through to the database, so several processes would each have their own copy.
+to the database first (memory changes only once the write succeeded), so several processes would each have their own copy.
+Usage history is the exception: it is not kept in memory but queried by date range when the Usage charts load.
+All of this happens at app startup (FastAPI lifespan), not at import.
 
 ```bash
 STORAGE=postgres DATABASE_URL=postgresql://gateway:secret@db.internal:5432/gateway uv run uvicorn app.main:app --port 8000
@@ -179,7 +183,7 @@ The PostgreSQL test works in a throwaway schema that it drops afterwards.
 
 ## Not done yet
 
-- SSO login, login rate limiting, session expiry, disabling users, wiring keys and budgets to LiteLLM's own key/team API.
+- SSO login, login rate limiting, disabling users, wiring keys and budgets to LiteLLM's own key/team API.
 - Several app processes against one database (today: one process, see [Storage](#storage)); schema migrations.
 - Project API keys are stored in clear so the UI can show them again; real LiteLLM keeps only hashes and shows a key once.
 - Notifications for requests (email or Teams); editing project members after creation.

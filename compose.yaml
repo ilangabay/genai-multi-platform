@@ -1,4 +1,4 @@
-# App + PostgreSQL. Set POSTGRES_PASSWORD (and ideally ADMIN_PASSWORD) in .env next to this file, then:
+# App + PostgreSQL. Set POSTGRES_PASSWORD and ADMIN_PASSWORD (12+ characters) in .env next to this file, then:
 #   docker compose up --build
 # Open http://localhost:8000 and sign in as admin with ADMIN_PASSWORD; you must change it at first sign-in.
 services:
@@ -21,7 +21,9 @@ services:
     environment:
       STORAGE: postgres
       DATABASE_URL: postgresql://gateway:${POSTGRES_PASSWORD}@db:5432/gateway
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-at-first-sign-in}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD (12+ characters) in .env}
+      SESSION_HOURS: ${SESSION_HOURS:-12}
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
       LITELLM_BASE_URL: ${LITELLM_BASE_URL:-}
       DEFAULT_PROJECT_BUDGET: ${DEFAULT_PROJECT_BUDGET:-100}
       BEDROCK_REGION: ${BEDROCK_REGION:-eu-west-3}

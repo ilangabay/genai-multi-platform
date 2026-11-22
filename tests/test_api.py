@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from app import litellm_mock, main, pricing
+from app import litellm_mock, main, pricing, store
 
 
 def login(username, password, role="user"):
@@ -266,3 +266,64 @@ def test_storage_config_fails_fast(monkeypatch):
         except RuntimeError as e:
             assert "DATABASE_URL" in str(e) or "memory" in str(e)
     assert not store.make_store("memory").persistent
+
+
+class FlakyDB(store.MemoryStore):
+    """Pretends to be a database whose writes fail."""
+    persistent = True
+
+    def save(self, table, key, doc):
+        raise OSError("database unreachable")
+
+
+def test_failed_write_leaves_memory_unchanged(monkeypatch):
+    a = admin()
+    monkeypatch.setattr(store, "STORE", FlakyDB())
+    try:
+        a.patch("/api/users/bob", json={"role": "admin"})
+    except OSError:
+        pass
+    assert main.USERS["bob"]["role"] == "user"
+    spend = team("hr-chatbot")["spend"]
+    try:
+        call(TestClient(main.app), main.PROJECTS["hr-chatbot"]["api_key"])
+    except OSError:
+        pass
+    assert team("hr-chatbot")["spend"] == spend
+
+
+def test_first_start_with_database_refuses_default_admin_password(monkeypatch):
+    monkeypatch.setattr(store, "make_store", lambda: type("EmptyDB", (store.MemoryStore,), {"persistent": True})())
+    for weak in ("admin", "change-me-at-first-sign-in", "short"):
+        monkeypatch.setenv("ADMIN_PASSWORD", weak)
+        try:
+            main.startup()
+            raise AssertionError(f"{weak!r} should have been refused")
+        except RuntimeError as e:
+            assert "ADMIN_PASSWORD" in str(e)
+    monkeypatch.setenv("ADMIN_PASSWORD", "a-long-first-password")
+    main.startup()
+    assert list(main.USERS) == ["admin"] and main.USERS["admin"]["must_change"] and not main.PROJECTS
+
+
+def test_admin_cannot_reset_own_password():
+    a = admin()
+    assert a.post("/api/users/admin/reset-password").status_code == 409
+    assert a.get("/api/me").status_code == 200  # still signed in
+
+
+def test_sessions_expire(monkeypatch):
+    c = login("bob", "user")
+    assert c.get("/api/me").status_code == 200
+    monkeypatch.setattr(main, "SESSION_HOURS", 0)
+    assert c.get("/api/me").status_code == 401
+    assert not [s for s in main.SESSIONS.values() if s["username"] == "bob"]  # dropped, not just refused
+
+
+def test_feedback_ids_continue_after_loaded_ones(monkeypatch):
+    loaded = {"7": {"id": 7, "by": "carol", "created": "", "message": "old"}}
+    monkeypatch.setattr(store, "make_store", lambda: type("DB", (store.MemoryStore,), {
+        "load": lambda self, table: dict(loaded) if table == "feedback" else {}})())
+    main.startup()
+    carol = login("carol", "user")
+    assert [carol.post("/api/feedback", json={"message": "new"}).json()["id"] for _ in range(3)] == [8, 9, 10]
