@@ -10,7 +10,7 @@ apps (air-gap) ──► guardrail LiteLLM endpoint ──► LiteLLM router ─
 ```
 
 This repo currently holds the **governance layer** and its web UI.
-Everything is mocked: no LLM is called, data lives in memory and resets on restart.
+Everything is mocked: no LLM is called. State lives in memory (local runs) or in PostgreSQL (deployments), see [Storage](#storage).
 Guardrails are built by another team; the mock endpoint stands in for both LiteLLM endpoints.
 
 ## Run
@@ -23,10 +23,11 @@ uv run uvicorn app.main:app --port 8000
 ```
 
 Open http://localhost:8000 and pick **Sign in as user** or **Sign in as admin**.
+Locally this runs with `STORAGE=memory`: demo users and projects are created at every start.
 
 | Role  | Username                  | Password (env var)         |
 |-------|---------------------------|----------------------------|
-| Admin | none                      | `admin` (`ADMIN_PASSWORD`) |
+| Admin | `admin`                   | `admin` (`ADMIN_PASSWORD`) |
 | User  | `alice`, `bob` or `carol` | `user` (`USER_PASSWORD`)   |
 
 Configuration is by environment variables. Copy `.env.example` to `.env` (gitignored), edit it, then
@@ -34,9 +35,11 @@ Configuration is by environment variables. Copy `.env.example` to `.env` (gitign
 
 | Env var                  | Default                                   | Purpose                                                        |
 |--------------------------|-------------------------------------------|----------------------------------------------------------------|
-| `ADMIN_PASSWORD`         | `admin`                                   | Admin password                                                 |
-| `USER_PASSWORD`          | `user`                                    | Shared user password (to be replaced by SSO)                   |
-| `GATEWAY_USERS`          | `alice,bob,carol`                         | Usernames allowed to sign in                                   |
+| `STORAGE`                | `memory`                                  | `memory` (local, nothing kept) or `postgres` (deployments)     |
+| `DATABASE_URL`           | none                                      | Required with `postgres`: `postgresql://user:password@host:5432/db` |
+| `ADMIN_PASSWORD`         | `admin`                                   | First password of the bootstrap admin account `admin`          |
+| `USER_PASSWORD`          | `user`                                    | First password of the `GATEWAY_USERS` demo accounts            |
+| `GATEWAY_USERS`          | `alice,bob,carol`                         | Demo user accounts created at startup                          |
 | `LITELLM_BASE_URL`       | `<this server>/v1`                        | Guardrail LiteLLM endpoint shown to users                      |
 | `DEFAULT_PROJECT_BUDGET` | `100`                                     | USD budget for new projects and project requests               |
 | `BEDROCK_REGION`         | `eu-west-3`                               | Region of the in-region Bedrock models and of their prices     |
@@ -58,10 +61,15 @@ Configuration is by environment variables. Copy `.env.example` to `.env` (gitign
 **Admins**
 - See all projects and create new ones (name, owner, members, budget; a key is generated).
 - Change budgets, revoke and regenerate API keys.
+- Add or remove models per project (LiteLLM team `models`). New projects start with every model; at least one stays.
+  Calls to a model that is not enabled get `401 team_model_access_denied`.
 - Usage page: totals and daily charts overall, per model and per project (spend or tokens, 7 / 30 / 90 days).
   Charts are plain inline SVG, no library or CDN, so they work in the air gap.
 - Requests list, pending first, with a count in the sidebar. Approving a project request creates it (owner = requester);
   approving a budget request adds the amount. A model request is only recorded: the admin adds the model to LiteLLM.
+- Users tab: add users (user or admin) with a generated temporary password, shown once with a ready-to-send message;
+  reset passwords (signs the user out); switch any account between user and admin (at least one admin stays).
+  Passwords are scrypt-hashed; a temporary password must be changed at first sign-in, enforced by the API.
 - All user feedback. Documentation tab, with an admin section.
 
 **Mock LLM endpoints**: `POST /v1/chat/completions` and `POST /v1/responses` (OpenAI formats, both exposed by LiteLLM).
@@ -109,25 +117,71 @@ curl http://localhost:8000/v1/chat/completions \
 
 The `Demo sandbox` project (owner `alice`) has a $0.02 budget so you hit the limit after two calls.
 
+## Storage
+
+| `STORAGE`  | Use                 | Behaviour |
+|------------|---------------------|-----------|
+| `memory`   | Local runs, tests   | Nothing is persisted. Demo users, projects and 90 days of usage are created at every start. |
+| `postgres` | Deployments         | Every change is written to PostgreSQL and loaded back at startup. No demo data: only the account `admin` is created on the first start, with `ADMIN_PASSWORD`, which must be changed at first sign-in. |
+
+`postgres` needs `DATABASE_URL` (user and password included); the app refuses to start without it, or if the
+database cannot be reached within 15 seconds. Tables are created on first start, one per kind of record:
+`users`, `sessions`, `projects`, `requests`, `feedback`, and `litellm_mock_teams`, `litellm_mock_keys`,
+`litellm_mock_spend_logs` for the LiteLLM stand-in (these go away once the real LiteLLM, with its own database, is wired).
+Each row is `(id, data jsonb, updated_at)`. Passwords are scrypt hashes and session tokens are stored as SHA-256 hashes.
+
+Run **one process** (`uvicorn` without `--workers`): the app keeps the data in memory and writes each change
+through to the database, so several processes would each have their own copy.
+
+```bash
+STORAGE=postgres DATABASE_URL=postgresql://gateway:secret@db.internal:5432/gateway uv run uvicorn app.main:app --port 8000
+```
+
+## Docker
+
+| File                 | Image                | What |
+|----------------------|----------------------|------|
+| `Dockerfile`         | `genai-gateway`      | The app: Python 3.12 slim, dependencies from `uv.lock` (no dev tools), non-root user, one uvicorn process on port 8000, healthcheck on `/`. Defaults to `STORAGE=memory`. |
+| `postgres/Dockerfile`| `genai-gateway-db`   | PostgreSQL 17 with role and database `gateway`, healthcheck with `pg_isready`. The password is given at run time, never built in. |
+| `compose.yaml`       |                      | Both together: the app in `postgres` mode, the database on a named volume (`pgdata`) and not published outside. |
+
+```bash
+# in .env: POSTGRES_PASSWORD=<letters and digits> and ADMIN_PASSWORD=<first admin password>
+docker compose up --build -d
+```
+
+Then open http://localhost:8000 and sign in as admin with `ADMIN_PASSWORD`; it must be changed at first sign-in.
+The app waits for the database healthcheck before starting. Without `POSTGRES_PASSWORD`, compose refuses to start.
+
+For the air-gapped VM, build the images on a connected machine (they pull from Docker Hub, ghcr.io and PyPI)
+and push them to the internal registry, or `docker save` / `docker load` them.
+
 ## Layout
 
 | Path                    | What                                          |
 |-------------------------|-----------------------------------------------|
-| `app/main.py`           | FastAPI: auth, projects, admin API            |
+| `app/main.py`           | FastAPI: auth, users, projects, requests, admin API |
+| `app/store.py`          | Storage: `memory` or `postgres`               |
 | `app/litellm_mock.py`   | LiteLLM stand-in: teams, keys, budgets, LLM endpoints |
 | `app/pricing.py`        | Bedrock prices from the AWS Price List Bulk API |
 | `app/static/index.html` | Whole UI (plain HTML/JS, no build step)       |
-| `tests/test_api.py`     | API tests                                     |
+| `tests/test_api.py`     | API tests (memory)                            |
+| `tests/test_postgres.py`| Restart test against PostgreSQL, skipped unless `TEST_DATABASE_URL` is set |
 
 ## Tests
 
 ```bash
 uv run pytest -q
+TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres uv run pytest -q   # adds the PostgreSQL test
 ```
+
+The PostgreSQL test works in a throwaway schema that it drops afterwards.
 
 ## Not done yet
 
-- Persistence (PostgreSQL), SSO login, wiring keys and budgets to LiteLLM's own key/team API.
+- SSO login, login rate limiting, session expiry, disabling users, wiring keys and budgets to LiteLLM's own key/team API.
+- Several app processes against one database (today: one process, see [Storage](#storage)); schema migrations.
+- Project API keys are stored in clear so the UI can show them again; real LiteLLM keeps only hashes and shows a key once.
 - Notifications for requests (email or Teams); editing project members after creation.
 - Anthropic-format `/v1/messages` in the mock (LiteLLM supports it in production).
 - A daily price sync job pushing prices to LiteLLM's `/model/update` (today: at startup, into the mock).

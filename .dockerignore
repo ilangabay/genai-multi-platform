@@ -1,0 +1,11 @@
+# only pyproject.toml, uv.lock and app/ are needed in the image
+.env
+.env.*
+!.env.example
+.git
+.venv
+.pytest_cache
+**/__pycache__
+.claude
+tests
+postgres

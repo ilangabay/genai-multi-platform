@@ -23,6 +23,7 @@ from fastapi import APIRouter, Body, Header
 from fastapi.responses import JSONResponse
 
 from app import pricing
+from app.store import STORE
 
 M = 1_000_000
 ONPREM_API_BASE = os.environ.get("ONPREM_API_BASE", "http://onprem-llm.internal:8000/v1")
@@ -77,9 +78,10 @@ if os.environ.get("SYNC_PRICES") == "1":
 
 MODELS = {m["model_name"]: m for m in MODEL_LIST}
 
-TEAMS: dict[str, dict] = {}  # team_id -> {team_alias, max_budget, spend}
-KEYS: dict[str, str] = {}    # virtual key -> team_id
-SPEND_LOGS: list[dict] = []  # one row per call, like LiteLLM_SpendLogs
+TEAMS: dict[str, dict] = STORE.load("litellm_mock_teams")  # team_id -> {team_alias, max_budget, spend, models}
+KEYS: dict[str, str] = {k: v["team_id"] for k, v in STORE.load("litellm_mock_keys").items()}  # virtual key -> team_id
+# one row per call, like LiteLLM_SpendLogs
+SPEND_LOGS: list[dict] = sorted(STORE.load("litellm_mock_spend_logs").values(), key=lambda r: r["startTime"])
 LOCK = threading.Lock()
 
 
@@ -89,15 +91,22 @@ def model_info() -> list[dict]:
     return MODEL_LIST
 
 
-def team_new(team_alias: str, max_budget: float) -> dict:
+def team_new(team_alias: str, max_budget: float, models: list[str]) -> dict:
+    """models: the team's allowed model names. Like LiteLLM, an empty list means every model."""
     team_id = str(uuid.uuid4())
-    TEAMS[team_id] = {"team_id": team_id, "team_alias": team_alias, "max_budget": max_budget, "spend": 0.0}
+    TEAMS[team_id] = {"team_id": team_id, "team_alias": team_alias, "max_budget": max_budget, "spend": 0.0,
+                      "models": list(models)}
+    STORE.save("litellm_mock_teams", team_id, TEAMS[team_id])
     return TEAMS[team_id]
 
 
-def team_update(team_id: str, max_budget: float) -> dict:
+def team_update(team_id: str, max_budget: float | None = None, models: list[str] | None = None) -> dict:
     with LOCK:
-        TEAMS[team_id]["max_budget"] = max_budget
+        if max_budget is not None:
+            TEAMS[team_id]["max_budget"] = max_budget
+        if models is not None:
+            TEAMS[team_id]["models"] = list(models)
+        STORE.save("litellm_mock_teams", team_id, TEAMS[team_id])
     return TEAMS[team_id]
 
 
@@ -108,6 +117,7 @@ def team_info(team_id: str) -> dict:
 def key_generate(team_id: str) -> dict:
     key = "sk-" + secrets.token_urlsafe(24)
     KEYS[key] = team_id
+    STORE.save("litellm_mock_keys", key, {"team_id": team_id})
     return {"key": key, "team_id": team_id}
 
 
@@ -130,7 +140,7 @@ def seed_history(team_id: str, total_spend: float, days: int = 90, seed: int = 0
             if tokens:
                 i = m["model_info"]
                 cost = tokens * (0.8 * i["input_cost_per_token"] + 0.2 * i["output_cost_per_token"])
-                rows.append({"startTime": f"{day}T12:00:00+00:00", "team_id": team_id, "model_group": m["model_name"],
+                rows.append({"id": uuid.uuid4().hex, "startTime": f"{day}T12:00:00+00:00", "team_id": team_id, "model_group": m["model_name"],
                              "spend": cost, "total_tokens": tokens})
     raw = sum(r["spend"] for r in rows)
     for r in rows:  # scale paid rows so the history matches the seeded spend
@@ -139,11 +149,15 @@ def seed_history(team_id: str, total_spend: float, days: int = 90, seed: int = 0
             r["total_tokens"] = int(r["total_tokens"] * total_spend / raw)
     SPEND_LOGS.extend(rows)
     TEAMS[team_id]["spend"] = sum(r["spend"] for r in rows) if raw else total_spend
+    for r in rows:
+        STORE.save("litellm_mock_spend_logs", r["id"], r)
+    STORE.save("litellm_mock_teams", team_id, TEAMS[team_id])
 
 
 def key_delete(keys: list[str]) -> dict:
     for k in keys:
         KEYS.pop(k, None)
+        STORE.delete("litellm_mock_keys", k)
     return {"deleted_keys": keys}
 
 
@@ -178,16 +192,22 @@ def _call(authorization: str, model_name, payload):
     if not model:
         return _error(400, f"Invalid model name passed in model={model_name}.", "invalid_request_error")
     team = TEAMS[team_id]
+    if team["models"] and model_name not in team["models"]:
+        return _error(401, f"Team={team['team_alias']} not allowed to access model={model_name}. "
+                           f"Allowed team models = {team['models']}", "team_model_access_denied")
     # Like LiteLLM: checked before the call, charged after it, so the last call can overshoot the budget.
     if team["spend"] >= team["max_budget"]:
         return _error(400, f"Budget has been exceeded! Team={team['team_alias']} "
                            f"Current cost: {team['spend']:.6f}, Max budget: {team['max_budget']}", "budget_exceeded")
     usage = _provider_usage(payload)
     cost = _cost(model["model_info"], usage)
+    log = {"id": uuid.uuid4().hex, "startTime": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+           "team_id": team_id, "model_group": model_name, "spend": cost, "total_tokens": sum(usage.values())}
     with LOCK:
         team["spend"] += cost
-        SPEND_LOGS.append({"startTime": datetime.now(timezone.utc).isoformat(timespec="seconds"), "team_id": team_id,
-                           "model_group": model_name, "spend": cost, "total_tokens": sum(usage.values())})
+        SPEND_LOGS.append(log)
+        STORE.save("litellm_mock_teams", team_id, team)
+        STORE.save("litellm_mock_spend_logs", log["id"], log)
     return model, usage, cost
 
 

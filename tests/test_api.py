@@ -10,7 +10,7 @@ def login(username, password, role="user"):
 
 
 def admin():
-    return login("", "admin", role="admin")
+    return login("admin", "admin", role="admin")
 
 
 def team(pid):
@@ -198,3 +198,71 @@ def test_calls_show_up_in_usage_today():
     before = sum(r["spend"] for r in today_haiku())
     cost = float(call(a, main.PROJECTS["contract-review"]["api_key"], "claude-haiku-5-5").headers["x-litellm-response-cost"])
     assert abs(sum(r["spend"] for r in today_haiku()) - before - cost) < 1e-9
+
+
+def test_admin_sets_project_models():
+    a, key = admin(), main.PROJECTS["contract-review"]["api_key"]
+    assert login("bob", "user").put("/api/projects/contract-review/models", json={"models": ["claude-haiku-5-5"]}).status_code == 403
+    assert a.put("/api/projects/contract-review/models", json={"models": []}).status_code == 422
+    assert a.put("/api/projects/contract-review/models", json={"models": ["gpt-x"]}).status_code == 422
+    try:
+        p = a.put("/api/projects/contract-review/models", json={"models": ["llama-70b-onprem", "claude-haiku-5-5"]}).json()
+        assert p["models"] == ["claude-haiku-5-5", "llama-70b-onprem"]  # catalog order
+        assert call(a, key, "claude-haiku-5-5").status_code == 200
+        r = call(a, key, "claude-opus-5-5")
+        assert r.status_code == 401 and r.json()["error"]["type"] == "team_model_access_denied"
+        listed = {x["id"]: x for x in login("bob", "user").get("/api/projects").json()}["contract-review"]
+        assert listed["models"] == p["models"]
+    finally:
+        a.put("/api/projects/contract-review/models", json={"models": list(litellm_mock.MODELS)})
+
+
+def test_user_management():
+    a = admin()
+    assert login("bob", "user").post("/api/users", json={"username": "dave"}).status_code == 403
+    assert a.post("/api/users", json={"username": "A b"}).status_code == 422
+    assert a.post("/api/users", json={"username": "bob"}).status_code == 409
+    created = a.post("/api/users", json={"username": "dave"}).json()
+    assert created["role"] == "user" and created["must_change"] and len(created["password"]) >= 16
+    assert "password" not in str(a.get("/api/users").json())  # hashes and passwords never listed
+
+    # first sign-in: only the password change works
+    dave = login("dave", created["password"])
+    assert dave.get("/api/projects").status_code == 403
+    assert dave.post("/api/me/password", json={"current": created["password"], "new": "short"}).status_code == 422
+    assert dave.post("/api/me/password", json={"current": "wrong", "new": "a-long-new-password"}).status_code == 403
+    assert dave.post("/api/me/password", json={"current": created["password"], "new": "a-long-new-password"}).status_code == 200
+    assert dave.get("/api/projects").json() == []
+
+    # promote: dave can now sign in as admin; demote: his admin session ends at once
+    c = TestClient(main.app)
+    assert c.post("/api/login", json={"role": "admin", "username": "dave", "password": "a-long-new-password"}).status_code == 401
+    assert a.patch("/api/users/dave", json={"role": "admin"}).json()["role"] == "admin"
+    dave_admin = login("dave", "a-long-new-password", role="admin")
+    assert dave_admin.get("/api/users").status_code == 200
+    assert a.patch("/api/users/dave", json={"role": "user"}).status_code == 200
+    assert dave_admin.get("/api/users").status_code == 401
+
+    # reset: new temporary password, old one and old sessions stop working
+    reset = a.post("/api/users/dave/reset-password").json()
+    assert dave.get("/api/me").status_code == 401
+    assert c.post("/api/login", json={"role": "user", "username": "dave", "password": "a-long-new-password"}).status_code == 401
+    assert login("dave", reset["password"]).get("/api/me").json()["must_change_password"]
+
+
+def test_last_admin_cannot_be_demoted():
+    a = admin()
+    assert a.patch("/api/users/admin", json={"role": "user"}).status_code == 409
+    assert a.patch("/api/users/admin", json={"role": "owner"}).status_code == 422
+
+
+def test_storage_config_fails_fast(monkeypatch):
+    from app import store
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    for storage in ("postgres", "sqlite"):
+        try:
+            store.make_store(storage)
+            raise AssertionError(f"{storage} should have been refused")
+        except RuntimeError as e:
+            assert "DATABASE_URL" in str(e) or "memory" in str(e)
+    assert not store.make_store("memory").persistent
