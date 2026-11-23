@@ -1,6 +1,6 @@
 """Governance layer of the gateway VM (mock).
 
-Owns projects (name, owner, members) and the web UI. Money and keys live in LiteLLM:
+Owns projects (name, owners, members) and the web UI. Money and keys live in LiteLLM:
 each project is a LiteLLM team with a max_budget, and its API key is a LiteLLM virtual key
 of that team. Spend is read back from LiteLLM, never computed here.
 In production, apps call the guardrail LiteLLM endpoint, which forwards to the LiteLLM router
@@ -33,7 +33,7 @@ DEFAULT_ADMIN_PASSWORDS = {"admin", "change-me-at-first-sign-in"}  # public in t
 
 # Working set: filled by startup() from the store; every change goes to the store first (see app/store.py)
 USERS: dict[str, dict] = {}     # username -> {username, role, password (scrypt hash), must_change, created}
-PROJECTS: dict[str, dict] = {}  # id -> {id, name, owner, members, team_id, api_key}
+PROJECTS: dict[str, dict] = {}  # id -> {id, name, owners, members, team_id, api_key}
 REQUESTS: list[dict] = []       # project, budget and model requests from users
 FEEDBACK: list[dict] = []
 SESSIONS: dict[str, dict] = {}  # sha256(cookie token) -> {username, role, created}
@@ -49,7 +49,7 @@ def add_project(name: str, owner: str, members: list[str], budget: float) -> dic
     pid = slug(name)
     # explicit list, so a model added to LiteLLM later is not opened to every project
     team = litellm.team_new(team_alias=pid, max_budget=budget, models=[m["model_name"] for m in litellm.model_info()])
-    project = {"id": pid, "name": name, "owner": owner, "members": sorted(set(members) - {owner}),
+    project = {"id": pid, "name": name, "owners": [owner], "members": sorted(set(members) - {owner}),
                "team_id": team["team_id"], "api_key": litellm.key_generate(team["team_id"])["key"]}
     store.STORE.save("projects", pid, project)
     PROJECTS[pid] = project
@@ -92,6 +92,9 @@ def startup():
     for live, table in ((USERS, "users"), (PROJECTS, "projects"), (SESSIONS, "sessions")):
         live.clear()
         live.update(db.load(table))
+    for p in PROJECTS.values():  # rows saved before projects had several owners
+        if "owner" in p:
+            p["owners"] = [p.pop("owner")]
     for key, s in list(SESSIONS.items()):
         if expired(s):
             db.delete("sessions", key)
@@ -276,7 +279,7 @@ def set_role(username: str, role: str = Body(..., embed=True), user: dict = Depe
 # ---------- projects ----------
 
 def visible(p: dict, user: dict) -> bool:
-    return user["role"] == "admin" or user["username"] == p["owner"] or user["username"] in p["members"]
+    return user["role"] == "admin" or user["username"] in p["owners"] + p["members"]
 
 
 def get_project(pid: str) -> dict:
@@ -385,6 +388,42 @@ def regenerate_key(pid: str, user: dict = Depends(admin_only)):
         litellm.key_delete([p["api_key"]])
     # the spend stays on the team, so a new key does not reset the budget
     return with_budget(store.update("projects", pid, p, api_key=litellm.key_generate(p["team_id"])["key"]))
+
+
+# ---------- project members: owners and admins manage them ----------
+
+def managed_project(pid: str, user: dict) -> dict:
+    p = get_project(pid)
+    if user["role"] != "admin" and user["username"] not in p["owners"]:
+        raise HTTPException(403, "Only the project owners and admins can manage members")
+    return p
+
+
+def set_project_role(pid: str, p: dict, username: str, role: str | None) -> dict:
+    """role None removes the user from the project."""
+    owners = [u for u in p["owners"] if u != username] + ([username] if role == "owner" else [])
+    members = [u for u in p["members"] if u != username] + ([username] if role == "member" else [])
+    if not owners:
+        raise HTTPException(409, "Keep at least one owner")
+    return with_budget(store.update("projects", pid, p, owners=sorted(owners), members=sorted(members)))
+
+
+@app.put("/api/projects/{pid}/members/{username}")
+def set_member(pid: str, username: str, role: str = Body(..., embed=True), user: dict = Depends(current_user)):
+    p = managed_project(pid, user)
+    if username not in USERS:
+        raise HTTPException(404, "Unknown user")
+    if role not in {"owner", "member"}:
+        raise HTTPException(422, "Role must be owner or member")
+    return set_project_role(pid, p, username, role)
+
+
+@app.delete("/api/projects/{pid}/members/{username}")
+def remove_member(pid: str, username: str, user: dict = Depends(current_user)):
+    p = managed_project(pid, user)
+    if username not in p["owners"] + p["members"]:
+        raise HTTPException(404, "Not a member of this project")
+    return set_project_role(pid, p, username, None)
 
 
 # ---------- requests and feedback ----------

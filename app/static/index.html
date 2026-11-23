@@ -102,6 +102,10 @@
   details[open] summary::before { transform: rotate(90deg); }
   summary .price { margin-left: auto; color: var(--muted); font-size: 13px; }
   details .sample { padding: 0 6px 14px; display: grid; gap: 8px; }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 16px 0 4px; }
+  .tabs button { background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; color: var(--muted);
+                 padding: 8px 14px; margin-bottom: -1px; }
+  .tabs button[aria-selected="true"] { color: var(--blue); border-bottom-color: var(--blue); font-weight: 600; }
   .seg { display: inline-flex; }
   .seg button { padding: 3px 10px; font-size: 13px; border-radius: 0; }
   .seg button:first-child { border-radius: 6px 0 0 6px; }
@@ -164,7 +168,7 @@ const usd = n => '$' + Number(n).toFixed(n < 1 ? 4 : 2);
 const per1M = n => '$' + n.toFixed(n && n < 0.1 ? 3 : 2);
 const price = m => m.input || m.output
   ? `${per1M(m.input)} in${m.cached != null ? ` · ${per1M(m.cached)} cached` : ''} · ${per1M(m.output)} out / 1M tokens` : 'Free';
-let me, cfg, projects = [], models = [], users = [], requests = [], feedback = [], view = 'overview', showKey = false, creating = false,
+let me, cfg, projects = [], models = [], users = [], requests = [], feedback = [], view = 'overview', ptab = 'overview', showKey = false, creating = false,
     lang = 'curl', apiKind = 'chat', loginRole, reqDraft = { kind: 'project', project: '' };
 
 async function api(path, opts = {}) {
@@ -217,13 +221,13 @@ $('#logout').onclick = async () => { await api('/api/logout', { method: 'POST' }
 // ---------- navigation ----------
 document.querySelector('nav').onclick = async e => {
   const a = e.target.closest('a'); if (!a) return;
-  e.preventDefault(); view = a.dataset.project ? pv(a.dataset.project) : a.dataset.view; showKey = false; creating = false; issued = null;
+  e.preventDefault(); view = a.dataset.project ? pv(a.dataset.project) : a.dataset.view; ptab = 'overview'; showKey = false; creating = false; issued = null;
   await (view === 'requests' || view === 'feedback' ? loadInbox() : view === 'users' ? loadUsers() : view === 'password' ? null : loadUsage());
   render(); scrollTo(0, 0);
 };
 $('#main').addEventListener('click', async e => {
   const row = e.target.closest('[data-open]');
-  if (row) { view = pv(row.dataset.open); await loadUsage(); render(); }
+  if (row) { view = pv(row.dataset.open); ptab = 'overview'; await loadUsage(); render(); }
   const req = e.target.closest('[data-request]');
   if (req) { reqDraft = { kind: req.dataset.request, project: req.dataset.project || '' }; view = 'requests'; await loadInbox(); render(); scrollTo(0, 0); }
   const c = e.target.closest('[data-copy]');
@@ -282,9 +286,9 @@ function overview() {
     <p class="muted">${projects.length} project${projects.length === 1 ? '' : 's'}</p>
     ${creating ? createForm() : ''}
     <div class="card">${projects.length ? `<table>
-      <tr><th>Project</th><th>Owner</th><th>Spent</th><th>Budget</th><th style="width:30%">Usage</th></tr>
+      <tr><th>Project</th><th>Owners</th><th>Spent</th><th>Budget</th><th style="width:30%">Usage</th></tr>
       ${projects.map(p => `<tr class="click" data-open="${esc(p.id)}">
-        <td>${esc(p.name)}</td><td>${esc(p.owner)}</td><td>${usd(p.spent)}</td><td>${usd(p.budget)}</td><td>${bar(p)}</td></tr>`).join('')}
+        <td>${esc(p.name)}</td><td>${p.owners.map(esc).join(', ')}</td><td>${usd(p.spent)}</td><td>${usd(p.budget)}</td><td>${bar(p)}</td></tr>`).join('')}
     </table>` : '<p class="muted" style="margin:0">No project yet. Request one to get an endpoint and an API key.</p>'}</div>
 
     <div class="card"><div class="head"><h3>Available models</h3>
@@ -357,10 +361,14 @@ function projectView(p) {
   const admin = me.role === 'admin';
   const left = Math.max(0, p.budget - p.spent);
   const key = p.api_key ? (showKey ? p.api_key : p.api_key.slice(0, 8) + '•'.repeat(16)) : null;
+  const tabs = [['overview', 'Overview'], ['models', 'Models'], ['members', 'Members']];
   return `<h2>${esc(p.name)}</h2>
-    <span class="muted">Owner ${esc(p.owner)}${p.members.length ? ' · Members ' + p.members.map(esc).join(', ') : ''}</span>
-
-    <div class="cols"><div class="card"><h3>Budget</h3>
+    <span class="muted">Owners ${p.owners.map(esc).join(', ')} · ${p.members.length} member${p.members.length === 1 ? '' : 's'}</span>
+    <div class="tabs" role="tablist" aria-label="Project">${tabs.map(([t, label]) =>
+      `<button type="button" role="tab" id="tab-${t}" data-ptab="${t}" aria-selected="${ptab === t}" aria-controls="ptab-panel"
+        tabindex="${ptab === t ? 0 : -1}">${label}</button>`).join('')}</div>
+    <div role="tabpanel" id="ptab-panel" aria-labelledby="tab-${ptab}">
+    ${ptab === 'models' ? modelsTab(p) : ptab === 'members' ? membersTab(p) : `<div class="cols"><div class="card"><h3>Budget</h3>
       <div><strong>${usd(p.spent)}</strong> <span class="muted">used of ${usd(p.budget)} · ${usd(left)} left</span></div>
       ${bar(p)}
       ${admin ? `<div class="row" style="margin-top:12px"><label for="budget" class="label">Budget $</label>
@@ -384,9 +392,13 @@ function projectView(p) {
     </div></div>
 
     <div class="card"><div class="head"><h3>Usage per model</h3><div class="tools">${usageFilters()}</div></div>
-      ${chart('project-models', `${p.name} usage per model`, series(r => r.model, models.map(m => [m.id, m.id]), r => r.project === p.id))}</div>
+      ${chart('project-models', `${p.name} usage per model`, series(r => r.model, models.map(m => [m.id, m.id]), r => r.project === p.id))}</div>`}
+    </div>`;
+}
 
-    <div class="card"><div class="head"><h3>Models</h3>
+function modelsTab(p) {
+  const admin = me.role === 'admin';
+  return `<div class="card"><div class="head"><h3>Models</h3>
         <div class="tools">${seg('kind', apiKind, [['chat', 'Chat Completions'], ['responses', 'Responses']])}
           ${seg('lang', lang, [['curl', 'curl'], ['python', 'Python']])}</div></div>
       ${admin ? `<fieldset class="pick"><legend>Models this project can call</legend><div class="checks">${models.map(m =>
@@ -402,10 +414,62 @@ function projectView(p) {
     </div>`;
 }
 
+const canManage = p => me.role === 'admin' || p.owners.includes(me.username);
+
+function membersTab(p) {
+  const manage = canManage(p);
+  const people = [...p.owners.map(u => [u, 'owner']), ...p.members.map(u => [u, 'member'])];
+  const opt = (r, cur, label) => `<option value="${r}" ${r === cur ? 'selected' : ''}>${label}</option>`;
+  return `${manage ? `<form class="card" id="member-form"><h3>Add member</h3><div class="row" style="margin:0">
+      <input name="username" required maxlength="32" placeholder="Username" aria-label="Username" autocomplete="off">
+      <select name="role" aria-label="Role">${opt('member', 'member', 'Member')}${opt('owner', 'member', 'Owner')}</select>
+      <button>Add</button><span id="member-msg" class="error" role="alert"></span></div></form>` : ''}
+    <div class="card"><h3>Members</h3>
+      <p class="muted" style="margin-top:0">Owners${manage ? '' : ' (and admins)'} add and remove members and change roles. Everyone here can use the project's API key.</p>
+      <table><tr><th>Username</th><th>Role</th>${manage ? '<th></th>' : ''}</tr>
+      ${people.map(([u, r]) => `<tr><td>${esc(u)}${u === me.username ? ' <span class="muted">(you)</span>' : ''}</td>
+        <td>${manage ? `<select data-member="${esc(u)}" aria-label="Role of ${esc(u)}">${opt('owner', r, 'Owner')}${opt('member', r, 'Member')}</select>`
+          : r === 'owner' ? 'Owner' : 'Member'}</td>
+        ${manage ? `<td><button class="ghost" data-remove="${esc(u)}">Remove</button></td>` : ''}</tr>`).join('')}</table>
+      <span id="members-msg" class="error" role="alert"></span></div>`;
+}
+
 function bindProject(p) {
   // admin actions show their error next to the buttons instead of failing silently
   const on = (id, msg, fn) => { const el = document.getElementById(id); if (el) el.onclick = async () => {
     try { await fn(); } catch (err) { document.getElementById(msg).textContent = err.message; } }; };
+  const tabs = [...document.querySelectorAll('[data-ptab]')];
+  tabs.forEach((b, i) => {
+    b.onclick = () => { ptab = b.dataset.ptab; render(); $('#tab-' + ptab).focus(); };
+    b.onkeydown = e => {  // arrow keys move between tabs (WAI-ARIA tabs pattern)
+      const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+      if (next !== undefined) { e.preventDefault(); tabs[(next + tabs.length) % tabs.length].click(); }
+    };
+  });
+  const members = (path, opts) => api(`/api/projects/${p.id}/members/${encodeURIComponent(path)}`, opts);
+  // after a change the signed-in user may have lost access: refresh() then falls back to the home page
+  const afterMembers = async () => { await refresh(); if (!projects.some(x => x.id === p.id)) { view = 'overview'; render(); } };
+  const mf = $('#member-form');
+  if (mf) {
+    mf.onsubmit = async e => {
+      e.preventDefault();
+      try { await members(mf.username.value.trim().toLowerCase(), { method: 'PUT', body: JSON.stringify({ role: mf.role.value }) }); await afterMembers(); $('#member-form')?.username.focus(); }
+      catch (err) { $('#member-msg').textContent = err.message; }
+    };
+  }
+  document.querySelectorAll('[data-member]').forEach(s => s.onchange = async () => {
+    const u = s.dataset.member;
+    if (u === me.username && s.value === 'member' && me.role !== 'admin'
+        && !confirm('Become a member? You will no longer manage this project.')) { s.value = 'owner'; return; }
+    try { await members(u, { method: 'PUT', body: JSON.stringify({ role: s.value }) }); await afterMembers(); }
+    catch (err) { s.value = s.value === 'owner' ? 'member' : 'owner'; $('#members-msg').textContent = err.message; }
+  });
+  document.querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
+    const u = b.dataset.remove, self = u === me.username;
+    if (!confirm(self ? 'Leave this project? You lose access to it.' : `Remove ${u} from this project?`)) return;
+    try { await members(u, { method: 'DELETE' }); await afterMembers(); }
+    catch (err) { $('#members-msg').textContent = err.message; }
+  });
   on('toggle-key', 'key-msg', () => { showKey = !showKey; render(); });
   on('save-budget', 'budget-msg', async () => {
     const value = $('#budget').value.trim();  // an empty field would otherwise be sent as 0
@@ -590,7 +654,7 @@ You will be asked to choose your own password at first sign-in.`;
 
 function usersView() {
   const admins = users.filter(u => u.role === 'admin').length;
-  const count = name => projects.filter(p => p.owner === name || p.members.includes(name)).length;
+  const count = name => projects.filter(p => p.owners.includes(name) || p.members.includes(name)).length;
   const opt = (u, r, label) => `<option value="${r}" ${u.role === r ? 'selected' : ''}>${label}</option>`;
   return `<h2>Users</h2>
     <p class="muted">${users.length} accounts · ${admins} admin${admins === 1 ? '' : 's'}. New users get a temporary password that they change at first sign-in.</p>
@@ -801,6 +865,11 @@ function docsView() {
     The check runs before each call, so the last call can go slightly over budget.
     Only admins change budgets: use <b>Request budget increase</b> on the project page.</p>
 
+    <h4>Project members</h4>
+    <p>A project page has three tabs: <b>Overview</b> (budget, endpoint, API key, usage), <b>Models</b> (sample requests) and
+    <b>Members</b>. A project has one or more owners and any number of members; all of them can use the project's API key.
+    Owners add members by username, remove them and switch them between owner and member. A project always keeps one owner.</p>
+
     <h4>Requests and feedback</h4>
     <p>The <b>Requests</b> page lets you ask for a new project, a budget increase or a new model, and shows their status
     and the admin's note. Use <b>Feedback</b> for anything else you want the platform team to know.</p>
@@ -813,7 +882,7 @@ function docsView() {
       <tr><td>400</td><td><code>invalid_request_error</code></td><td>For example a model name that is not in your project's list.</td></tr></table>
 
     ${me.role === 'admin' ? `<h4>For admins</h4>
-    <ul><li><b>New project</b> on the Overview page creates a project with its owner, members, budget and first API key.</li>
+    <ul><li><b>New project</b> on the Overview page creates a project with its owner, members, budget and first API key. Admins can manage the members of every project.</li>
       <li>On a project page you can change the budget, revoke the key (calls fail at once) or regenerate it (the old key stops working).</li>
       <li>Under <b>Models this project can call</b>, tick or untick a model to add or remove it. It applies at once; a project keeps at least one model.
         New projects start with every model.</li>

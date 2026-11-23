@@ -53,6 +53,9 @@ Configuration is by environment variables. Copy `.env.example` to `.env` (gitign
 
 **Users** (see only projects they own or are a member of)
 - Home page: their projects and the list of available models with prices (on-prem models are free).
+- A project page has three tabs: Overview (budget, endpoint and key, usage chart), Models (samples) and Members.
+- Project owners add members by username, remove them and switch them between owner and member
+  (a project keeps at least one owner). Members see the list read-only. Admins manage every project.
 - Budget used and left (read-only).
 - Endpoint and API key (show / copy).
 - Per project, a chart of daily usage per model (spend or tokens, 7 / 30 / 90 days).

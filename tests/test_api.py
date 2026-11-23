@@ -162,7 +162,7 @@ def test_requests_flow():
     assert a.post(f"/api/requests/{budget['id']}/approve").status_code == 409  # applied once only
 
     assert a.post(f"/api/requests/{proj['id']}/approve").status_code == 200
-    assert main.PROJECTS["bob-lab"]["owner"] == "bob" and team("bob-lab")["max_budget"] == main.DEFAULT_PROJECT_BUDGET
+    assert main.PROJECTS["bob-lab"]["owners"] == ["bob"] and team("bob-lab")["max_budget"] == main.DEFAULT_PROJECT_BUDGET
     assert a.post(f"/api/requests/{model['id']}/reject", json={"note": "not on Bedrock EU"}).json()["status"] == "rejected"
 
 
@@ -327,3 +327,20 @@ def test_feedback_ids_continue_after_loaded_ones(monkeypatch):
     main.startup()
     carol = login("carol", "user")
     assert [carol.post("/api/feedback", json={"message": "new"}).json()["id"] for _ in range(3)] == [8, 9, 10]
+
+
+def test_project_members():
+    alice, bob = login("alice", "user"), login("bob", "user")
+    url = "/api/projects/code-assistant/members/"
+    assert bob.put(url + "carol", json={"role": "member"}).status_code == 403  # bob is a member, not an owner
+    p = alice.put(url + "carol", json={"role": "member"}).json()
+    assert p["owners"] == ["alice"] and p["members"] == ["bob", "carol"]
+    assert alice.put(url + "bob", json={"role": "owner"}).json()["owners"] == ["alice", "bob"]
+    assert bob.delete(url + "carol").json()["members"] == []  # bob is an owner now
+    assert "code-assistant" not in [p["id"] for p in login("carol", "user").get("/api/projects").json()]
+    assert alice.put(url + "mallory", json={"role": "member"}).status_code == 404
+    assert alice.put(url + "carol", json={"role": "admin"}).status_code == 422
+    assert alice.delete(url + "alice").status_code == 200
+    assert bob.delete(url + "bob").status_code == 409  # last owner
+    assert bob.put(url + "bob", json={"role": "member"}).status_code == 409
+    assert admin().put(url + "carol", json={"role": "owner"}).status_code == 200  # admins manage every project
