@@ -9,3 +9,5 @@
 .claude
 tests
 postgres
+litellm
+certs

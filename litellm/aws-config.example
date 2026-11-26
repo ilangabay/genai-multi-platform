@@ -1,0 +1,10 @@
+# AWS config for the LiteLLM container: copy to litellm/aws-config (gitignored) and fill in the three ARNs.
+# compose.yaml mounts it as AWS_CONFIG_FILE, and the certificate and key from ./certs to /certs.
+#
+# aws_signing_helper turns the VM certificate into short-lived credentials for the "gateway VM" role
+# (IAM Roles Anywhere). LiteLLM then calls STS AssumeRole from that role into BEDROCK_ROLE_ARN.
+# boto3 runs the helper again when the credentials expire. Nothing secret is in this file.
+[default]
+region = eu-west-3
+sts_regional_endpoints = regional
+credential_process = aws_signing_helper credential-process --certificate /certs/gateway.crt --private-key /certs/gateway.key --trust-anchor-arn arn:aws:rolesanywhere:eu-west-3:111122223333:trust-anchor/REPLACE --profile-arn arn:aws:rolesanywhere:eu-west-3:111122223333:profile/REPLACE --role-arn arn:aws:iam::111122223333:role/genai-gateway-vm

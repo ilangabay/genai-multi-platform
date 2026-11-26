@@ -1,0 +1,69 @@
+# LiteLLM proxy config (image: litellm/Dockerfile, service: compose.yaml).
+#
+# AWS access: LiteLLM calls STS AssumeRole into BEDROCK_ROLE_ARN, using the VM's own identity as the caller.
+# That identity comes from IAM Roles Anywhere (the VM certificate), see litellm/aws-config.example and docs/aws-setup.md.
+#
+# Prices: USD per token. Bedrock rows are the in-region on-demand list prices for eu-west-3
+# (AWS price file of 2026-11-11). LiteLLM's built-in prices for these IDs are the lower global ones,
+# so they are set here. `uv run python -m app.pricing` prints the current ones (needs pricing.us-east-1 access).
+# The governance app reads models and prices back from /model/info: nothing to change there.
+
+model_list:
+  - model_name: claude-opus-5-5
+    litellm_params:
+      model: bedrock/anthropic.claude-opus-5-5
+      aws_region_name: os.environ/BEDROCK_REGION
+      aws_role_name: os.environ/BEDROCK_ROLE_ARN
+      aws_session_name: genai-gateway
+      input_cost_per_token: 0.0000044
+      output_cost_per_token: 0.000022
+      cache_read_input_token_cost: 0.00000022
+      cache_creation_input_token_cost: 0.0000055
+    model_info: {platform: Bedrock}
+
+  - model_name: claude-sonnet-5-5
+    litellm_params:
+      model: bedrock/anthropic.claude-sonnet-5-5
+      aws_region_name: os.environ/BEDROCK_REGION
+      aws_role_name: os.environ/BEDROCK_ROLE_ARN
+      aws_session_name: genai-gateway
+      input_cost_per_token: 0.0000022
+      output_cost_per_token: 0.000011
+      cache_read_input_token_cost: 0.00000011
+      cache_creation_input_token_cost: 0.00000275
+    model_info: {platform: Bedrock}
+
+  - model_name: claude-haiku-5-5
+    litellm_params:
+      model: bedrock/anthropic.claude-haiku-5-5
+      aws_region_name: os.environ/BEDROCK_REGION
+      aws_role_name: os.environ/BEDROCK_ROLE_ARN
+      aws_session_name: genai-gateway
+      input_cost_per_token: 0.00000011
+      output_cost_per_token: 0.00000055
+      cache_read_input_token_cost: 0.000000011
+      cache_creation_input_token_cost: 0.0000001375
+    model_info: {platform: Bedrock}
+
+  # On-prem (OpenAI-compatible, e.g. vLLM): free, so calls never use budget. They fail until ONPREM_API_BASE answers.
+  - model_name: mistral-small-onprem
+    litellm_params:
+      model: hosted_vllm/mistral-small
+      api_base: os.environ/ONPREM_API_BASE
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+    model_info: {platform: On-prem}
+
+  - model_name: llama-70b-onprem
+    litellm_params:
+      model: hosted_vllm/llama-3.3-70b
+      api_base: os.environ/ONPREM_API_BASE
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+    model_info: {platform: On-prem}
+
+litellm_settings:
+  drop_params: true  # silently drop OpenAI parameters a provider does not support
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY  # admin key: the governance app uses it, never shown to users

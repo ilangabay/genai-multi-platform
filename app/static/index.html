@@ -113,6 +113,7 @@
   .tools { display: flex; gap: 10px; flex-wrap: wrap; }
   .grid { display: grid; grid-template-columns: 90px 1fr; gap: 10px 12px; align-items: center; }
   .checks { display: flex; gap: 14px; flex-wrap: wrap; }
+  label.stack { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
   fieldset.pick { border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px 12px; margin: 0 0 14px; }
   fieldset.pick legend { color: var(--muted); font-size: 13px; padding: 0 6px; }
   .docs { max-width: 820px; }
@@ -147,6 +148,7 @@
     <a href="#" data-view="overview">Overview</a>
     <a href="#" data-view="usage" class="hidden admin-only">Usage</a>
     <a href="#" data-view="users" class="hidden admin-only">Users</a>
+    <a href="#" data-view="catalog" class="hidden admin-only">Catalog</a>
     <div class="section">Projects</div>
     <div id="nav-projects"></div>
     <div class="section">Workspace</div>
@@ -263,13 +265,14 @@ function render() {
   const p = projects.find(p => pv(p.id) === view);
   $('#main').innerHTML = p ? projectView(p) : view === 'docs' ? docsView() : view === 'requests' ? requestsView()
     : view === 'feedback' ? feedbackView() : view === 'password' ? passwordView() : me.role !== 'admin' ? overview()
-    : view === 'usage' ? usageView() : view === 'users' ? usersView() : overview();
+    : view === 'usage' ? usageView() : view === 'users' ? usersView() : view === 'catalog' ? catalogView() : overview();
   bindCharts();
   if (p) bindProject(p);
   if (view === 'overview' && creating) bindCreate();
   if (view === 'requests') bindRequests();
   if (view === 'feedback') bindFeedback();
   if (view === 'users' && me.role === 'admin') bindUsers();
+  if (view === 'catalog' && me.role === 'admin') bindCatalog();
   if (view === 'password') bindPassword();
 }
 
@@ -301,6 +304,11 @@ function overview() {
 
 const platform = m => m.platform === 'Bedrock' ? `Bedrock · ${cfg.bedrock_region}` : m.platform;
 
+// models of the platform catalog as checkboxes, none ticked: a project only gets the models picked here
+const modelPicker = () => `<div class="checks">${models.map(m =>
+  `<label><input type="checkbox" name="models" value="${esc(m.id)}"> ${esc(m.id)}
+    <span class="muted">${esc(platform(m))}</span></label>`).join('')}</div>`;
+
 function createForm() {
   return `<form class="card" id="create-form"><h3>New project</h3>
     <div class="grid">
@@ -309,6 +317,7 @@ function createForm() {
       <span>Members</span><div class="checks">${users.map(({ username: u }) =>
         `<label><input type="checkbox" name="members" value="${esc(u)}"> ${esc(u)}</label>`).join('')}</div>
       <label for="np-budget">Budget $</label><input id="np-budget" name="budget" type="number" min="0" step="0.01" value="${cfg.default_budget}" required style="width:140px">
+      <span>Models</span>${modelPicker()}
     </div>
     <div class="row" style="margin:16px 0 0"><button>Create</button><button type="button" class="ghost" id="cancel-create">Cancel</button>
       <span id="create-error" class="error" role="alert"></span></div>
@@ -324,7 +333,8 @@ function bindCreate() {
     const fd = new FormData(f);
     try {
       const p = await api('/api/projects', { method: 'POST', body: JSON.stringify({
-        name: fd.get('name'), owner: fd.get('owner'), members: fd.getAll('members'), budget: Number(fd.get('budget')) }) });
+        name: fd.get('name'), owner: fd.get('owner'), members: fd.getAll('members'), budget: Number(fd.get('budget')),
+        models: fd.getAll('models') }) });
       creating = false; view = pv(p.id); refresh();
     } catch (err) { $('#create-error').textContent = err.message; }
   };
@@ -404,12 +414,14 @@ function modelsTab(p) {
       ${admin ? `<fieldset class="pick"><legend>Models this project can call</legend><div class="checks">${models.map(m =>
         `<label><input type="checkbox" data-model="${esc(m.id)}" ${p.models.includes(m.id) ? 'checked' : ''}> ${esc(m.id)}</label>`).join('')}</div>
         <span id="models-msg" class="error" role="alert"></span></fieldset>` : ''}
-      <p class="muted" style="margin:0 0 8px">Open a model to see a sample request. Set <code>GATEWAY_API_KEY</code> to this project's key first.</p>
+      ${p.models.length ? `<p class="muted" style="margin:0 0 8px">Open a model to see a sample request. Set <code>GATEWAY_API_KEY</code> to this project's key first.</p>`
+        : `<p class="muted" style="margin:0">This project cannot call any model yet.
+          ${admin ? 'Tick the models it may use above.' : `<button class="ghost" data-request="model" data-project="${esc(p.id)}">Request a model</button>`}</p>`}
       ${models.filter(m => p.models.includes(m.id)).map(m => `<details><summary><code>${esc(m.id)}</code><span class="pill">${esc(platform(m))}</span>
           <span class="price">${price(m)}</span></summary>
         <div class="sample"><pre>${esc(sample(p.endpoint, m.id))}</pre>
           <div><button class="ghost" data-copy="${esc(sample(p.endpoint, m.id))}">Copy</button>
-          <button class="ghost" data-try="${esc(m.id)}">Send mock request</button>
+          <button class="ghost" data-try="${esc(m.id)}">Send test request</button>
           <span class="try-result" role="status"></span></div></div></details>`).join('')}
     </div>`;
 }
@@ -515,8 +527,9 @@ function bindProject(p) {
       await refresh();
       const now = projects.find(x => x.id === p.id);
       // cost as billed by LiteLLM, from the provider's usage block
-      const cost = Number(r.headers.get('x-litellm-response-cost'));
-      msg = r.ok ? `<span class="muted">${esc(text)} Cost ${cost ? usd(cost) : 'free'} · ${usd(Math.max(0, now.budget - now.spent))} left</span>`
+      // the real LiteLLM is on another origin and does not expose this header to the page: then no cost is shown
+      const header = r.headers.get('x-litellm-response-cost'), cost = Number(header);
+      msg = r.ok ? `<span class="muted">${esc(text)}${header === null ? '' : ` Cost ${cost ? usd(cost) : 'free'}`} · ${usd(Math.max(0, now.budget - now.spent))} left</span>`
                  : `<span class="error">${r.status} · ${esc(d.error.message)}</span>`;
     }
     const det = [...document.querySelectorAll('[data-try]')].find(x => x.dataset.try === model).closest('details');
@@ -652,6 +665,62 @@ Username: ${u.username}
 Temporary password: ${u.password}
 You will be asked to choose your own password at first sign-in.`;
 
+// ---------- catalog (admin) ----------
+function catalogView() {
+  const price1M = (name, label) => `<label class="stack">${label}
+    <input name="${name}" type="number" min="0" step="any" style="width:120px" ${name === 'input' || name === 'output' ? 'required' : ''}></label>`;
+  return `<h2>Catalog</h2>
+    <p class="muted">The models of the platform. A project can only call the catalog models an admin whitelisted on it (project page, Models tab).</p>
+    <form class="card" id="cat-form"><h3>Add a Bedrock model</h3>
+      <div class="grid">
+        <label for="cat-model">Model ID or ARN</label>
+        <div class="row" style="margin:0"><input id="cat-model" name="model" required style="flex:1;min-width:240px" autocomplete="off"
+          placeholder="anthropic.claude-sonnet-5-5 · eu.anthropic.claude-sonnet-5-5 · arn:aws:bedrock:…:inference-profile/…">
+          <button type="button" class="ghost" id="cat-lookup">Look up</button></div>
+        <label for="cat-name">Name</label><input id="cat-name" name="name" required maxlength="63" autocomplete="off"
+          placeholder="What projects put in &quot;model&quot;, e.g. claude-sonnet-5-5">
+        <span>USD / 1M tokens</span><div class="row" style="margin:0;align-items:flex-end">
+          ${price1M('input', 'Input')}${price1M('output', 'Output')}${price1M('cache_read', 'Cache read')}${price1M('cache_write', 'Cache write')}</div>
+      </div>
+      <p class="muted" id="cat-source" role="status" style="margin:12px 0 0">Look up fills the name and LiteLLM's list prices for this ID. LiteLLM bills calls with the prices you save.</p>
+      <div class="row" style="margin:12px 0 0"><button>Add to catalog</button><span id="cat-msg" class="error" role="alert"></span></div>
+    </form>
+    <div class="card"><table><tr><th>Name</th><th>Platform</th><th>Provider model</th><th>Price</th><th></th></tr>
+      ${models.map(m => `<tr><td><code>${esc(m.id)}</code></td><td>${esc(platform(m))}</td><td><code>${esc(m.model)}</code></td>
+        <td class="muted">${price(m)}</td>
+        <td>${m.added ? `<button class="ghost" data-uncatalog="${esc(m.id)}">Remove</button>` : '<span class="muted">litellm/config.yaml</span>'}</td></tr>`).join('')}</table>
+      <span id="catalog-msg" class="error" role="alert"></span></div>`;
+}
+
+function bindCatalog() {
+  const f = $('#cat-form'), num = v => v === '' ? null : Number(v);
+  $('#cat-lookup').onclick = async () => {
+    $('#cat-msg').textContent = '';
+    try {
+      const r = await api('/api/catalog/lookup?model=' + encodeURIComponent(f.model.value.trim()));
+      if (!f.name.value) f.name.value = r.name;
+      for (const k of ['input', 'output', 'cache_read', 'cache_write']) f[k].value = r[k] ?? '';
+      $('#cat-source').textContent = r.price_source
+        ? `Prices from LiteLLM's list for ${r.price_source} (calls go to ${r.region}). Check them on the AWS Bedrock pricing page before adding.`
+        : `No price known for this ID: enter the prices from the AWS Bedrock pricing page (region ${r.region}).`;
+    } catch (err) { $('#cat-msg').textContent = err.message; }
+  };
+  f.onsubmit = async e => {
+    e.preventDefault();
+    try {
+      models = await api('/api/catalog', { method: 'POST', body: JSON.stringify({ name: f.name.value, model: f.model.value,
+        input: num(f.input.value), output: num(f.output.value), cache_read: num(f.cache_read.value), cache_write: num(f.cache_write.value) }) });
+      render();
+    } catch (err) { $('#cat-msg').textContent = err.message; }
+  };
+  document.querySelectorAll('[data-uncatalog]').forEach(b => b.onclick = async () => {
+    const name = b.dataset.uncatalog;
+    if (!confirm(`Remove ${name} from the catalog? Projects lose access to it at once.`)) return;
+    try { models = await api('/api/catalog/' + encodeURIComponent(name), { method: 'DELETE' }); await refresh(); }
+    catch (err) { $('#catalog-msg').textContent = err.message; }
+  });
+}
+
 function usersView() {
   const admins = users.filter(u => u.role === 'admin').length;
   const count = name => projects.filter(p => p.owners.includes(name) || p.members.includes(name)).length;
@@ -735,7 +804,8 @@ function bindPassword() {
 const projectName = id => projects.find(p => p.id === id)?.name || id;
 
 function describe(r) {
-  if (r.kind === 'project') return `New project <b>${esc(r.name)}</b> · ${usd(r.amount)} budget`;
+  if (r.kind === 'project') return `New project <b>${esc(r.name)}</b> · ${usd(r.amount)} budget`
+    + (r.models ? ` · ${r.models.length === models.length ? 'all models' : r.models.map(esc).join(', ')}` : '');
   if (r.kind === 'budget') return `Budget +${usd(r.amount)} for <b>${esc(projectName(r.project))}</b>`;
   return `Model <b>${esc(r.name)}</b>${r.project ? ` for ${esc(projectName(r.project))}` : ''}`;
 }
@@ -768,10 +838,13 @@ function requestForm() {
     <div style="margin-bottom:16px">${seg('rkind', k, [['project', 'New project'], ['budget', 'Budget increase'], ['model', 'New model']])}</div>
     <div class="grid">
       ${k === 'budget' ? projectSelect(false) : `<label for="rq-name">${k === 'model' ? 'Model' : 'Name'}</label>
-        <input id="rq-name" name="name" required maxlength="200" ${k === 'model' ? 'placeholder="Model name and platform"' : ''}>`}
+        <input id="rq-name" name="name" required maxlength="200" ${k === 'model'
+          ? 'list="rq-catalog" placeholder="A catalog model, or any other model and its platform"' : ''}>
+        ${k === 'model' ? `<datalist id="rq-catalog">${models.map(m => `<option value="${esc(m.id)}">`).join('')}</datalist>` : ''}`}
       ${k === 'model' ? projectSelect(true) : `<label for="rq-amount">${k === 'budget' ? 'Add $' : 'Budget $'}</label>
         <input id="rq-amount" name="amount" type="number" min="0.01" step="0.01" required style="width:140px"
           value="${k === 'project' ? cfg.default_budget : ''}">`}
+      ${k === 'project' ? `<span>Models</span>${modelPicker()}` : ''}
       <label for="rq-reason">Reason</label><textarea id="rq-reason" name="reason" rows="2" maxlength="2000"></textarea>
     </div>
     <div class="row" style="margin:16px 0 0"><button>Send request</button><span id="req-msg" role="status"></span></div>
@@ -786,7 +859,7 @@ function bindRequests() {
     const fd = new FormData(f);
     try {
       await api('/api/requests', { method: 'POST', body: JSON.stringify({ kind: reqDraft.kind, name: fd.get('name') || '',
-        project: fd.get('project') || '', amount: Number(fd.get('amount') || 0), reason: fd.get('reason') }) });
+        project: fd.get('project') || '', amount: Number(fd.get('amount') || 0), models: fd.getAll('models'), reason: fd.get('reason') }) });
       await loadInbox(); render();
       $('#req-msg').innerHTML = '<span class="muted">Request sent ✓ An admin will review it.</span>';
     } catch (err) { $('#req-msg').innerHTML = `<span class="error">${esc(err.message)}</span>`; }
@@ -871,7 +944,8 @@ function docsView() {
     Owners add members by username, remove them and switch them between owner and member. A project always keeps one owner.</p>
 
     <h4>Requests and feedback</h4>
-    <p>The <b>Requests</b> page lets you ask for a new project, a budget increase or a new model, and shows their status
+    <p>The <b>Requests</b> page lets you ask for a new project (and pick its models from the catalog), a budget increase
+    or a model for one of your projects, and shows their status
     and the admin's note. Use <b>Feedback</b> for anything else you want the platform team to know.</p>
 
     <h4>Errors</h4>
@@ -884,11 +958,14 @@ function docsView() {
     ${me.role === 'admin' ? `<h4>For admins</h4>
     <ul><li><b>New project</b> on the Overview page creates a project with its owner, members, budget and first API key. Admins can manage the members of every project.</li>
       <li>On a project page you can change the budget, revoke the key (calls fail at once) or regenerate it (the old key stops working).</li>
-      <li>Under <b>Models this project can call</b>, tick or untick a model to add or remove it. It applies at once; a project keeps at least one model.
-        New projects start with every model.</li>
+      <li>Under <b>Models this project can call</b>, tick or untick a model to add or remove it. It applies at once.
+        A project can only call the models ticked there: a new project gets the ones ticked in <b>New project</b>, none by default.</li>
+      <li><b>Catalog</b> lists the platform's models. <b>Add a Bedrock model</b> takes a model ID or ARN (inference profiles too);
+        <b>Look up</b> fills a name and LiteLLM's list prices to check. Added models can be removed there, which also takes them off
+        every project. The role in <code>BEDROCK_ROLE_ARN</code> must be allowed to invoke the model.</li>
       <li><b>Requests</b> shows pending requests first, with a count in the sidebar. Approving a project request creates it with the
-        requester as owner; approving a budget request adds the amount to the budget. A model request is only recorded:
-        add the model to LiteLLM's config yourself.</li>
+        requester as owner; approving a budget request adds the amount to the budget. Approving a request for a catalog model enables it on
+        the project; a model that is not in the catalog is only recorded: add it to LiteLLM's config yourself.</li>
       <li><b>Feedback</b> lists everything users sent.</li>
       <li><b>Users</b>: add an account (user or admin) and send the generated temporary password with <b>Copy message for the user</b>;
         it is shown once and the user must change it at first sign-in. <b>Reset password</b> issues a new one and signs the user out.

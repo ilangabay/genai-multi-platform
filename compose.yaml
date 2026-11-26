@@ -1,6 +1,10 @@
-# App + PostgreSQL. Set POSTGRES_PASSWORD and ADMIN_PASSWORD (12+ characters) in .env next to this file, then:
-#   docker compose up --build
-# Open http://localhost:8000 and sign in as admin with ADMIN_PASSWORD; you must change it at first sign-in.
+# Governance app + LiteLLM proxy + PostgreSQL. Before the first start (details in docs/aws-setup.md):
+#   - .env next to this file: POSTGRES_PASSWORD, ADMIN_PASSWORD (12+ characters), LITELLM_MASTER_KEY, LITELLM_SALT_KEY,
+#     BEDROCK_ROLE_ARN
+#   - certs/gateway.crt and certs/gateway.key: the VM certificate for IAM Roles Anywhere
+#   - litellm/aws-config: copied from litellm/aws-config.example, ARNs filled in
+# Then: docker compose up --build
+# Governance UI on http://localhost:8000 (sign in as admin with ADMIN_PASSWORD), LLM endpoint on http://localhost:4000/v1.
 services:
   db:
     build: postgres
@@ -10,7 +14,37 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
-    # no published port: only the app reaches the database
+    # no published port: only the app and LiteLLM reach the database
+
+  litellm:
+    build: litellm
+    image: genai-gateway-litellm
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://gateway:${POSTGRES_PASSWORD}@db:5432/litellm
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY (sk- followed by a long random string) in .env}
+      # models added from the Catalog page are kept in LiteLLM's database, their settings encrypted with this key
+      STORE_MODEL_IN_DB: "True"
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?set LITELLM_SALT_KEY in .env (never change it afterwards)}
+      BEDROCK_REGION: ${BEDROCK_REGION:-eu-west-3}
+      BEDROCK_ROLE_ARN: ${BEDROCK_ROLE_ARN:?set BEDROCK_ROLE_ARN in .env}
+      ONPREM_API_BASE: ${ONPREM_API_BASE:-http://onprem-llm.internal:8000/v1}
+      AWS_CONFIG_FILE: /aws/config
+      AWS_REGION: ${BEDROCK_REGION:-eu-west-3}  # STS calls go to sts.<region>.amazonaws.com
+    volumes:
+      - ./litellm/aws-config:/aws/config:ro
+      - ./certs:/certs:ro
+    ports:
+      - "4000:4000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness')"]
+      interval: 10s
+      timeout: 5s
+      start_period: 90s  # database migrations on the first start
+      retries: 5
+    restart: unless-stopped
 
   app:
     build: .
@@ -18,16 +52,20 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      litellm:
+        condition: service_healthy
     environment:
       STORAGE: postgres
       DATABASE_URL: postgresql://gateway:${POSTGRES_PASSWORD}@db:5432/gateway
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD (12+ characters) in .env}
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      # what users put in their code: the LiteLLM address as they reach it
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://localhost:4000/v1}
       SESSION_HOURS: ${SESSION_HOURS:-12}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
-      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-}
       DEFAULT_PROJECT_BUDGET: ${DEFAULT_PROJECT_BUDGET:-100}
       BEDROCK_REGION: ${BEDROCK_REGION:-eu-west-3}
-      SYNC_PRICES: ${SYNC_PRICES:-0}
     ports:
       - "8000:8000"
     restart: unless-stopped

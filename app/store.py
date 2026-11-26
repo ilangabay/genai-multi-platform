@@ -13,7 +13,7 @@ Spend logs are the exception to "everything in memory": with a database they are
 import os
 
 TABLES = ("users", "sessions", "projects", "requests", "feedback",
-          "litellm_mock_teams", "litellm_mock_keys", "litellm_mock_spend_logs")  # mock_ tables go once LiteLLM is wired
+          "litellm_mock_teams", "litellm_mock_keys", "litellm_mock_spend_logs", "litellm_mock_models")  # mock_ tables go once LiteLLM is wired
 
 
 class MemoryStore:

@@ -70,6 +70,12 @@ def sync_prices(prices: dict[str, dict]) -> list[str]:
 
 
 MODELS = {m["model_name"]: m for m in MODEL_LIST}
+# In LiteLLM an empty team model list means every model, so "no model" is a list holding only this name
+NO_MODELS = "no-default-models"
+
+
+def _team_models(models: list[str]) -> list[str]:
+    return list(models) or [NO_MODELS]
 
 TEAMS: dict[str, dict] = {}  # team_id -> {team_alias, max_budget, spend, models}
 KEYS: dict[str, str] = {}    # virtual key -> team_id
@@ -89,6 +95,11 @@ def startup():
     KEYS.clear()
     KEYS.update({k: v["team_id"] for k, v in store.STORE.load("litellm_mock_keys").items()})
     SPEND_LOGS.clear()
+    # catalog = models of the config + models added through /model/new (LiteLLM keeps those in its database)
+    MODEL_LIST[:] = [m for m in MODEL_LIST if not m["model_info"].get("db_model")]
+    MODEL_LIST.extend(store.STORE.load("litellm_mock_models").values())
+    MODELS.clear()
+    MODELS.update({m["model_name"]: m for m in MODEL_LIST})
 
 
 # ---------- admin API (called by the governance layer) ----------
@@ -97,23 +108,53 @@ def model_info() -> list[dict]:
     return MODEL_LIST
 
 
+def model_add(model_name: str, litellm_params: dict, model_info: dict) -> dict:
+    """Like LiteLLM's /model/new: the model is stored and joins the catalog at once."""
+    # LiteLLM reports the prices given in litellm_params back in model_info, which is where calls are priced from here
+    prices = {k: v for k, v in litellm_params.items() if k.endswith(("_cost_per_token", "_token_cost"))}
+    entry = {"model_name": model_name, "litellm_params": litellm_params,
+             "model_info": {**model_info, **prices, "id": uuid.uuid4().hex, "db_model": True}}
+    store.STORE.save("litellm_mock_models", entry["model_info"]["id"], entry)
+    MODEL_LIST.append(entry)
+    MODELS[model_name] = entry
+    return entry
+
+
+def model_delete(model_id: str):
+    """Like LiteLLM's /model/delete: only models added through model_add can go."""
+    entry = next(m for m in MODEL_LIST if m["model_info"].get("id") == model_id)
+    store.STORE.delete("litellm_mock_models", model_id)
+    MODEL_LIST.remove(entry)
+    MODELS.pop(entry["model_name"], None)
+
+
+def cost_map() -> dict:
+    """Stand-in for LiteLLM's built-in price list: the prices of this config, by Bedrock ID (local runs only)."""
+    fields = ("input_cost_per_token", "output_cost_per_token", "cache_read_input_token_cost", "cache_creation_input_token_cost")
+    return {m["litellm_params"]["model"].removeprefix("bedrock/"): {f: m["model_info"][f] for f in fields if f in m["model_info"]}
+            for m in MODEL_LIST if m["litellm_params"]["model"].startswith("bedrock/")}
+
+
 def team_new(team_alias: str, max_budget: float, models: list[str]) -> dict:
-    """models: the team's allowed model names. Like LiteLLM, an empty list means every model."""
+    """models: the team's allowed model names; empty = none (stored as [NO_MODELS], like LiteLLM)."""
     team_id = str(uuid.uuid4())
-    team = {"team_id": team_id, "team_alias": team_alias, "max_budget": max_budget, "spend": 0.0, "models": list(models)}
+    team = {"team_id": team_id, "team_alias": team_alias, "max_budget": max_budget, "spend": 0.0, "models": _team_models(models)}
     store.STORE.save("litellm_mock_teams", team_id, team)
     TEAMS[team_id] = team
     return team
 
 
 def team_update(team_id: str, max_budget: float | None = None, models: list[str] | None = None) -> dict:
-    changes = {k: v for k, v in (("max_budget", max_budget), ("models", models and list(models))) if v is not None}
+    changes = {k: v for k, v in (("max_budget", max_budget), ("models", models)) if v is not None}
+    if models is not None:
+        changes["models"] = _team_models(models)
     with LOCK:
         return store.update("litellm_mock_teams", team_id, TEAMS[team_id], **changes)
 
 
 def team_info(team_id: str) -> dict:
-    return TEAMS[team_id]
+    team = TEAMS[team_id]
+    return {**team, "models": [m for m in team["models"] if m != NO_MODELS]}
 
 
 def key_generate(team_id: str) -> dict:
@@ -123,8 +164,8 @@ def key_generate(team_id: str) -> dict:
     return {"key": key, "team_id": team_id}
 
 
-def spend_logs(start_date: str) -> list[dict]:
-    """Rows since start_date (YYYY-MM-DD, UTC). Production: LiteLLM's /spend/logs, or a query on its spend tables."""
+def spend_logs(start_date: str, team_ids: list[str] | None = None) -> list[dict]:
+    """Rows since start_date (YYYY-MM-DD, UTC). team_ids is for the real client: the caller filters."""
     if store.STORE.persistent:
         return store.STORE.since("litellm_mock_spend_logs", "startTime", start_date)
     return [r for r in SPEND_LOGS if r["startTime"][:10] >= start_date]

@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from app import litellm_mock, main, pricing, store
@@ -14,7 +15,7 @@ def admin():
 
 
 def team(pid):
-    return litellm_mock.team_info(main.PROJECTS[pid]["team_id"])
+    return litellm_mock.TEAMS[main.PROJECTS[pid]["team_id"]]  # the live record, so tests can change budgets
 
 
 def call(c, key, model="claude-sonnet-5-5"):
@@ -95,6 +96,11 @@ def test_admin_creates_project():
     assert a.post("/api/projects", json={"name": "search poc", "owner": "bob", "budget": 5}).status_code == 409
     assert a.post("/api/projects", json={"name": "Other", "owner": "mallory", "budget": 5}).status_code == 422
     assert "search-poc" in {p["id"] for p in login("carol", "user").get("/api/projects").json()}
+    # no model until an admin whitelists one: LiteLLM gets a non-empty list, since an empty one would mean every model
+    assert p["models"] == [] and team("search-poc")["models"] == [litellm_mock.NO_MODELS]
+    r = call(a, p["api_key"])
+    assert r.status_code == 401 and r.json()["error"]["type"] == "team_model_access_denied"
+    a.put("/api/projects/search-poc/models", json={"models": ["claude-sonnet-5-5"]})
     assert call(a, p["api_key"]).status_code == 200
 
 
@@ -203,7 +209,8 @@ def test_calls_show_up_in_usage_today():
 def test_admin_sets_project_models():
     a, key = admin(), main.PROJECTS["contract-review"]["api_key"]
     assert login("bob", "user").put("/api/projects/contract-review/models", json={"models": ["claude-haiku-5-5"]}).status_code == 403
-    assert a.put("/api/projects/contract-review/models", json={"models": []}).status_code == 422
+    assert a.put("/api/projects/contract-review/models", json={"models": []}).json()["models"] == []
+    assert call(a, key, "claude-haiku-5-5").status_code == 401  # empty whitelist: nothing, not everything
     assert a.put("/api/projects/contract-review/models", json={"models": ["gpt-x"]}).status_code == 422
     try:
         p = a.put("/api/projects/contract-review/models", json={"models": ["llama-70b-onprem", "claude-haiku-5-5"]}).json()
@@ -344,3 +351,75 @@ def test_project_members():
     assert bob.delete(url + "bob").status_code == 409  # last owner
     assert bob.put(url + "bob", json={"role": "member"}).status_code == 409
     assert admin().put(url + "carol", json={"role": "owner"}).status_code == 200  # admins manage every project
+
+
+def test_real_litellm_daily_usage_is_read_per_team_and_model(monkeypatch):
+    from app import litellm_proxy
+    day = lambda d, models: {"date": d, "metrics": {}, "breakdown": {"model_groups": {
+        m: {"metrics": {"spend": s, "total_tokens": t}} for m, (s, t) in models.items()}}}
+    pages = {("t1", 1): {"results": [day("2026-11-20", {"claude-haiku-5-5": (0.5, 100)})], "metadata": {"has_more": True}},
+             ("t1", 2): {"results": [day("2026-11-21", {"claude-opus-5-5": (2.0, 50)})], "metadata": {"has_more": False}},
+             ("t2", 1): {"results": [], "metadata": {}}}
+    monkeypatch.setattr(litellm_proxy, "_call", lambda method, path, body=None, **q: pages[(q["team_ids"], q["page"])])
+    assert litellm_proxy.spend_logs("2026-11-01", ["t1", "t2"]) == [
+        {"startTime": "2026-11-20", "team_id": "t1", "model_group": "claude-haiku-5-5", "spend": 0.5, "total_tokens": 100},
+        {"startTime": "2026-11-21", "team_id": "t1", "model_group": "claude-opus-5-5", "spend": 2.0, "total_tokens": 50}]
+
+
+def test_real_litellm_needs_postgres(monkeypatch):
+    from app import litellm_proxy
+    monkeypatch.setattr(main, "litellm", litellm_proxy)
+    with pytest.raises(RuntimeError, match="STORAGE=postgres"):
+        main.startup()
+
+
+def test_projects_pick_models_from_the_catalog():
+    a = admin()
+    p = a.post("/api/projects", json={"name": "Picked", "owner": "bob", "models": ["claude-haiku-5-5", "llama-70b-onprem"]}).json()
+    assert p["models"] == ["claude-haiku-5-5", "llama-70b-onprem"]
+    assert a.post("/api/projects", json={"name": "Empty", "owner": "bob"}).json()["models"] == []  # default: none
+    assert a.post("/api/projects", json={"name": "Bad", "owner": "bob", "models": ["gpt-x"]}).status_code == 422
+    assert "bad" not in main.PROJECTS  # nothing half-created
+
+    bob = login("bob", "user")
+    rid = bob.post("/api/requests", json={"kind": "project", "name": "Bob tools", "models": ["claude-sonnet-5-5"]}).json()["id"]
+    a.post(f"/api/requests/{rid}/approve", json={})
+    assert team("bob-tools")["models"] == ["claude-sonnet-5-5"]
+
+    # a catalog model asked for a project is enabled when approved; an unknown one is only recorded
+    assert bob.post("/api/requests", json={"kind": "model", "name": "claude-sonnet-5-5", "project": "bob-tools"}).status_code == 409
+    rid = bob.post("/api/requests", json={"kind": "model", "name": "claude-opus-5-5", "project": "bob-tools"}).json()["id"]
+    other = bob.post("/api/requests", json={"kind": "model", "name": "Some new model", "project": "bob-tools"}).json()["id"]
+    a.post(f"/api/requests/{rid}/approve", json={})
+    assert a.post(f"/api/requests/{other}/approve", json={}).status_code == 200
+    assert team("bob-tools")["models"] == ["claude-opus-5-5", "claude-sonnet-5-5"]
+
+
+def test_admin_adds_and_removes_bedrock_models_in_the_catalog():
+    a = admin()
+    assert login("bob", "user").get("/api/catalog/lookup?model=anthropic.claude-sonnet-5-5").status_code == 403
+    found = a.get("/api/catalog/lookup?model=arn:aws:bedrock:eu-west-3::foundation-model/anthropic.claude-sonnet-5-5").json()
+    assert found["name"] == "claude-sonnet-5-5" and found["input"] == 2.2 and found["cache_read"] == 0.11
+    unknown = a.get("/api/catalog/lookup?model=eu.amazon.nova-pro-v1:0").json()
+    assert unknown["name"] == "nova-pro-v1-0" and unknown["input"] is None
+    assert a.get("/api/catalog/lookup?model=curl http://x").status_code == 422
+
+    new = {"name": "nova-pro", "model": "eu.amazon.nova-pro-v1:0", "input": 0.8, "output": 3.2}
+    assert a.post("/api/catalog", json={**new, "name": "claude-opus-5-5"}).status_code == 409
+    assert a.post("/api/catalog", json={**new, "input": -1}).status_code == 422
+    listed = {m["id"]: m for m in a.post("/api/catalog", json=new).json()}
+    assert listed["nova-pro"]["added"] and listed["nova-pro"]["input"] == 0.8 and not listed["claude-opus-5-5"]["added"]
+    params = litellm_mock.MODELS["nova-pro"]["litellm_params"]
+    assert params["model"] == "bedrock/converse/eu.amazon.nova-pro-v1:0" and params["aws_role_name"] == "os.environ/BEDROCK_ROLE_ARN"
+
+    # projects can whitelist it, and calls are billed with its prices
+    a.put("/api/projects/contract-review/models", json={"models": ["nova-pro"]})
+    r = call(a, main.PROJECTS["contract-review"]["api_key"], "nova-pro")
+    assert r.status_code == 200 and float(r.headers["x-litellm-response-cost"]) > 0
+
+    assert a.delete("/api/catalog/claude-opus-5-5").status_code == 409  # from litellm/config.yaml
+    assert "nova-pro" not in {m["id"] for m in a.delete("/api/catalog/nova-pro").json()}
+    assert team("contract-review")["models"] == [litellm_mock.NO_MODELS]  # taken off the project too
+    a.post("/api/catalog", json=new)
+    main.startup()  # memory mode keeps nothing: the catalog is back to the config models, with no leftover
+    assert "nova-pro" not in litellm_mock.MODELS and len(litellm_mock.MODEL_LIST) == 5

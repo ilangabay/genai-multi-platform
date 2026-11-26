@@ -21,10 +21,12 @@ from fastapi import Body, Cookie, Depends, FastAPI, HTTPException, Query, Reques
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app import litellm_mock as litellm  # production: HTTP client for the LiteLLM admin API (master key)
-from app import store
+from app import litellm_mock, litellm_proxy, store
 
-LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL")  # guardrail LiteLLM endpoint shown to users; defaults to this mock
+# LITELLM_URL set: the real LiteLLM proxy (admin API with the master key). Unset: the in-process stand-in.
+litellm = litellm_proxy if os.environ.get("LITELLM_URL") else litellm_mock
+
+LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL")  # LLM endpoint shown to users; defaults to the stand-in on this server
 DEFAULT_PROJECT_BUDGET = float(os.environ.get("DEFAULT_PROJECT_BUDGET", "100"))  # USD, new projects and project requests
 SESSION_HOURS = float(os.environ.get("SESSION_HOURS", "12"))  # a sign-in expires after this
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE") == "1"  # set to 1 when the app is served over HTTPS
@@ -45,10 +47,20 @@ def slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
-def add_project(name: str, owner: str, members: list[str], budget: float) -> dict:
+def catalog_models(models: list[str] | None) -> list[str]:
+    """A project's whitelist, checked against the platform catalog (LiteLLM's model list), in catalog order.
+    Empty = no model. None = the whole catalog (demo projects only)."""
+    catalog = [m["model_name"] for m in litellm.model_info()]
+    if models is None:
+        return catalog
+    if not set(models) <= set(catalog):
+        raise HTTPException(422, "Unknown model: " + ", ".join(sorted(set(models) - set(catalog))))
+    return [m for m in catalog if m in models]
+
+
+def add_project(name: str, owner: str, members: list[str], budget: float, models: list[str] | None = None) -> dict:
     pid = slug(name)
-    # explicit list, so a model added to LiteLLM later is not opened to every project
-    team = litellm.team_new(team_alias=pid, max_budget=budget, models=[m["model_name"] for m in litellm.model_info()])
+    team = litellm.team_new(team_alias=pid, max_budget=budget, models=catalog_models(models))
     project = {"id": pid, "name": name, "owners": [owner], "members": sorted(set(members) - {owner}),
                "team_id": team["team_id"], "api_key": litellm.key_generate(team["team_id"])["key"]}
     store.STORE.save("projects", pid, project)
@@ -87,6 +99,8 @@ def startup():
     """Load the state from the store and create what a first start needs. Runs once, when the app starts."""
     global _request_ids, _feedback_ids, DUMMY_HASH
     store.init()
+    if litellm is litellm_proxy and not store.STORE.persistent:  # projects would vanish, their LiteLLM teams would not
+        raise RuntimeError("The real LiteLLM (LITELLM_URL) needs STORAGE=postgres")
     litellm.startup()
     db = store.STORE
     for live, table in ((USERS, "users"), (PROJECTS, "projects"), (SESSIONS, "sessions")):
@@ -321,9 +335,11 @@ def config(user: dict = Depends(current_user)):
 @app.get("/api/models")
 def list_models(user: dict = Depends(current_user)):
     # USD per 1M tokens for display, from LiteLLM's model config (the prices it bills with). On-prem is 0.
+    # added: put in the catalog from the Catalog page (LiteLLM database), so it can be removed there too
     return [{"id": m["model_name"], "platform": i["platform"], "input": i["input_cost_per_token"] * 1e6,
+             "model": i.get("bedrock_model") or m["litellm_params"]["model"], "added": bool(i.get("db_model")),
              "output": i["output_cost_per_token"] * 1e6,
-             "cached": i["cache_read_input_token_cost"] * 1e6 if "cache_read_input_token_cost" in i else None}
+             "cached": i["cache_read_input_token_cost"] * 1e6 if i.get("cache_read_input_token_cost") is not None else None}
             for m in litellm.model_info() for i in [m["model_info"]]]
 
 
@@ -335,7 +351,7 @@ def usage(days: int = Query(30, ge=1, le=366), user: dict = Depends(current_user
     teams = {p["team_id"]: p["id"] for p in list(PROJECTS.values()) if visible(p, user)}
     agg = defaultdict(lambda: [0.0, 0])
     # shortcut: sums raw per-call rows in Python; at volume, query LiteLLM's daily spend tables instead
-    for r in litellm.spend_logs(dates[0]):
+    for r in litellm.spend_logs(dates[0], list(teams)):
         if r["team_id"] in teams:
             a = agg[(r["startTime"][:10], teams[r["team_id"]], r["model_group"])]
             a[0] += r["spend"]
@@ -346,12 +362,15 @@ def usage(days: int = Query(30, ge=1, le=366), user: dict = Depends(current_user
 
 @app.post("/api/projects", status_code=201)
 def create_project(name: str = Body(...), owner: str = Body(...), members: list[str] = Body([]),
-                   budget: float = Body(DEFAULT_PROJECT_BUDGET), user: dict = Depends(admin_only)):
+                   budget: float = Body(DEFAULT_PROJECT_BUDGET), models: list[str] = Body([]),
+                   user: dict = Depends(admin_only)):
+    """models: the project's whitelist, from the platform catalog. None by default: the admin adds them."""
     name = new_project_name(name)
     if owner not in USERS or not set(members) <= set(USERS):
         raise HTTPException(422, "Unknown owner or member")
     valid_budget(budget)
-    return with_budget(add_project(name, owner, members, budget))
+    catalog_models(models)  # reject a bad list before anything is created in LiteLLM
+    return with_budget(add_project(name, owner, members, budget, models))
 
 
 @app.patch("/api/projects/{pid}/budget")
@@ -364,12 +383,7 @@ def set_budget(pid: str, budget: float = Body(..., embed=True), user: dict = Dep
 
 @app.put("/api/projects/{pid}/models")
 def set_models(pid: str, models: list[str] = Body(..., embed=True), user: dict = Depends(admin_only)):
-    catalog = [m["model_name"] for m in litellm.model_info()]
-    if not models:  # an empty list would mean "every model" in LiteLLM
-        raise HTTPException(422, "A project needs at least one model")
-    if not set(models) <= set(catalog):
-        raise HTTPException(422, "Unknown model")
-    litellm.team_update(get_project(pid)["team_id"], models=[m for m in catalog if m in models])
+    litellm.team_update(get_project(pid)["team_id"], models=catalog_models(models))
     return with_budget(get_project(pid))
 
 
@@ -426,6 +440,85 @@ def remove_member(pid: str, username: str, user: dict = Depends(current_user)):
     return set_project_role(pid, p, username, None)
 
 
+# ---------- platform catalog: admins add Bedrock models to LiteLLM (/model/new) ----------
+
+# a Bedrock model ID (anthropic.claude-sonnet-5-5, eu.anthropic.claude-sonnet-5-5) or ARN (foundation model,
+# inference profile, application inference profile, provisioned throughput)
+BEDROCK_MODEL = re.compile(r"arn:aws:bedrock:([a-z]{2}(?:-gov)?-[a-z]+-\d):\d{0,12}:[a-z-]+/[\w.:/-]+|[a-z0-9-]+(?:\.[\w:-]+)+")
+CATALOG_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}")
+GEO_PREFIXES = {"eu", "us", "apac", "au", "jp", "global", "us-gov"}  # cross-region inference profiles
+
+
+def bedrock_model(model: str) -> tuple[str, str]:
+    """Model ID or ARN as pasted by the admin -> (ID or ARN for Bedrock calls, region to call)."""
+    model = model.strip()
+    m = BEDROCK_MODEL.fullmatch(model)
+    if not m:
+        raise HTTPException(422, "Not a Bedrock model ID or ARN")
+    if ":foundation-model/" in model:  # a foundation model ARN is its ID in that region
+        return model.rsplit("/", 1)[1], m.group(1)
+    return model, m.group(1) or litellm.pricing.BEDROCK_REGION
+
+
+@app.get("/api/catalog/lookup")
+def catalog_lookup(model: str, user: dict = Depends(admin_only)):
+    """Suggested catalog name and prices (USD per 1M tokens) for a Bedrock model, from LiteLLM's price list."""
+    model_id, region = bedrock_model(model)
+    profile = model_id.rsplit("/", 1)[-1]  # an inference profile ARN ends with the profile ID
+    prefix, _, rest = profile.partition(".")
+    bare = rest if prefix in GEO_PREFIXES else profile
+    # in-region calls cost the regional rate, which LiteLLM lists under the geo profile (eu.*): the bare ID is the global rate
+    geo = {"eu": "eu", "us": "us", "ap": "apac"}.get(region.split("-")[0])
+    candidates = [profile] if prefix in GEO_PREFIXES else [f"{geo}.{bare}", bare] if geo else [bare]
+    prices = litellm.cost_map()
+    key = next((k for k in candidates if prices.get(k, {}).get("input_cost_per_token") is not None), None)
+    p = prices.get(key, {})
+    per1m = lambda f: round(p[f] * 1e6, 6) if p.get(f) is not None else None
+    return {"name": bare.split(".", 1)[-1].replace(":", "-").lower(), "model": model_id, "region": region, "price_source": key,
+            "input": per1m("input_cost_per_token"), "output": per1m("output_cost_per_token"),
+            "cache_read": per1m("cache_read_input_token_cost"), "cache_write": per1m("cache_creation_input_token_cost")}
+
+
+@app.post("/api/catalog", status_code=201)
+def catalog_add(name: str = Body(...), model: str = Body(...), input: float = Body(...), output: float = Body(...),
+                cache_read: float | None = Body(None), cache_write: float | None = Body(None),
+                user: dict = Depends(admin_only)):
+    """Adds a Bedrock model to the catalog. Prices in USD per 1M tokens: LiteLLM bills with them."""
+    name = name.strip().lower()
+    if not CATALOG_NAME.fullmatch(name):
+        raise HTTPException(422, "Name: lowercase letters, digits, dots and dashes")
+    if name in {m["model_name"] for m in litellm.model_info()}:
+        raise HTTPException(409, "The catalog already has a model with this name")
+    model_id, region = bedrock_model(model)
+    prices = {"input_cost_per_token": input, "output_cost_per_token": output,
+              "cache_read_input_token_cost": cache_read, "cache_creation_input_token_cost": cache_write}
+    if not all(v is None or v >= 0 for v in prices.values()):  # also rejects NaN
+        raise HTTPException(422, "Prices must be 0 or more")
+    litellm.model_add(name, {
+        "model": f"bedrock/converse/{model_id}",  # Converse: one request format for every Bedrock model
+        "aws_region_name": region,
+        "aws_role_name": "os.environ/BEDROCK_ROLE_ARN",  # resolved by LiteLLM from its own environment
+        "aws_session_name": "genai-gateway",
+        **{k: v / 1e6 for k, v in prices.items() if v is not None},
+    }, {"platform": "Bedrock", "bedrock_model": model_id})
+    return list_models(user)
+
+
+@app.delete("/api/catalog/{name}")
+def catalog_remove(name: str, user: dict = Depends(admin_only)):
+    entry = next((m for m in litellm.model_info() if m["model_name"] == name), None)
+    if not entry:
+        raise HTTPException(404, "Model not found")
+    if not entry["model_info"].get("db_model"):
+        raise HTTPException(409, "This model is defined in litellm/config.yaml: remove it there")
+    for p in list(PROJECTS.values()):  # take it off every whitelist too, so no project keeps a name that is gone
+        models = litellm.team_info(p["team_id"])["models"]
+        if name in models:
+            litellm.team_update(p["team_id"], models=[m for m in models if m != name])
+    litellm.model_delete(entry["model_info"]["id"])
+    return list_models(user)
+
+
 # ---------- requests and feedback ----------
 
 KINDS = {"project", "budget", "model"}
@@ -452,8 +545,9 @@ def list_requests(user: dict = Depends(current_user)):
 
 @app.post("/api/requests", status_code=201)
 def create_request(kind: str = Body(...), name: str = Body(""), project: str = Body(""), amount: float = Body(0),
-                   reason: str = Body(""), user: dict = Depends(current_user)):
-    """kind=project: name, amount (budget). kind=budget: project, amount (USD to add). kind=model: name, project optional."""
+                   models: list[str] = Body([]), reason: str = Body(""), user: dict = Depends(current_user)):
+    """kind=project: name, amount (budget), models (catalog; empty = all). kind=budget: project, amount (USD to add).
+    kind=model: name, project optional. A catalog model for a project is enabled on approval; any other is only recorded."""
     if user["role"] != "user":
         raise HTTPException(403, "Requests are made by users")
     if kind not in KINDS:
@@ -462,7 +556,8 @@ def create_request(kind: str = Body(...), name: str = Body(""), project: str = B
            "reason": text(reason, "Reason", required=False), "name": "", "project": "", "amount": 0.0, "note": ""}
     if kind == "project":
         valid_budget(amount)
-        req |= {"name": new_project_name(text(name, "Project name")), "amount": amount or DEFAULT_PROJECT_BUDGET}
+        req |= {"name": new_project_name(text(name, "Project name")), "amount": amount or DEFAULT_PROJECT_BUDGET,
+                "models": catalog_models(models)}
     elif kind == "budget":
         if not amount > 0:
             raise HTTPException(422, "Amount must be more than 0")
@@ -472,7 +567,10 @@ def create_request(kind: str = Body(...), name: str = Body(""), project: str = B
     else:
         if project and (project not in PROJECTS or not visible(PROJECTS[project], user)):
             raise HTTPException(404, "Project not found")
-        req |= {"name": text(name, "Model name"), "project": project}
+        name = text(name, "Model name")
+        if project and name in litellm.team_info(PROJECTS[project]["team_id"])["models"]:
+            raise HTTPException(409, "This project can already use this model")
+        req |= {"name": name, "project": project}
     store.STORE.save("requests", req["id"], req)
     REQUESTS.append(req)
     return req
@@ -496,11 +594,14 @@ def decide(req: dict, status: str, note: str, user: dict) -> dict:
 def approve_request(rid: int, note: str = Body("", embed=True), user: dict = Depends(admin_only)):
     req = get_request(rid)
     if req["kind"] == "project":
-        add_project(new_project_name(req["name"]), req["by"], [], req["amount"])
+        add_project(new_project_name(req["name"]), req["by"], [], req["amount"], req.get("models", []))
     elif req["kind"] == "budget":
         team = litellm.team_info(get_project(req["project"])["team_id"])
         litellm.team_update(team["team_id"], max_budget=team["max_budget"] + req["amount"])
-    # kind=model: the admin adds the model to LiteLLM's config; approving records the decision
+    elif req["project"] and req["name"] in [m["model_name"] for m in litellm.model_info()]:  # catalog model: enable it
+        team = litellm.team_info(get_project(req["project"])["team_id"])
+        litellm.team_update(team["team_id"], models=catalog_models(team["models"] + [req["name"]]))
+    # any other model request: the admin adds the model to LiteLLM's config; approving records the decision
     return decide(req, "approved", note, user)
 
 
