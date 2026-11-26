@@ -29,6 +29,9 @@ litellm = litellm_proxy if os.environ.get("LITELLM_URL") else litellm_mock
 LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL")  # LLM endpoint shown to users; defaults to the stand-in on this server
 DEFAULT_PROJECT_BUDGET = float(os.environ.get("DEFAULT_PROJECT_BUDGET", "100"))  # USD, new projects and project requests
 SESSION_HOURS = float(os.environ.get("SESSION_HOURS", "12"))  # a sign-in expires after this
+# Catalog page: the role LiteLLM assumes for Bedrock (not secret; LiteLLM refuses os.environ/ references in test calls)
+BEDROCK_ROLE_ARN = os.environ.get("BEDROCK_ROLE_ARN", "")
+ONPREM_API_BASE = os.environ.get("ONPREM_API_BASE", "http://onprem-llm.internal:8000/v1")  # default endpoint of new on-prem models
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE") == "1"  # set to 1 when the app is served over HTTPS
 STATIC = Path(__file__).parent / "static"
 DEFAULT_ADMIN_PASSWORDS = {"admin", "change-me-at-first-sign-in"}  # public in this repo, refused with a database
@@ -329,7 +332,8 @@ def list_projects(request: Request, user: dict = Depends(current_user)):
 
 @app.get("/api/config")
 def config(user: dict = Depends(current_user)):
-    return {"default_budget": DEFAULT_PROJECT_BUDGET, "bedrock_region": litellm.pricing.BEDROCK_REGION}
+    return {"default_budget": DEFAULT_PROJECT_BUDGET, "bedrock_region": litellm.pricing.BEDROCK_REGION,
+            "onprem_api_base": ONPREM_API_BASE}
 
 
 @app.get("/api/models")
@@ -337,7 +341,8 @@ def list_models(user: dict = Depends(current_user)):
     # USD per 1M tokens for display, from LiteLLM's model config (the prices it bills with). On-prem is 0.
     # added: put in the catalog from the Catalog page (LiteLLM database), so it can be removed there too
     return [{"id": m["model_name"], "platform": i["platform"], "input": i["input_cost_per_token"] * 1e6,
-             "model": i.get("bedrock_model") or m["litellm_params"]["model"], "added": bool(i.get("db_model")),
+             "model": i.get("bedrock_model") or m["litellm_params"]["model"], "endpoint": i.get("endpoint"),
+             "aws_model": i.get("aws_model"), "added": bool(i.get("db_model")),
              "output": i["output_cost_per_token"] * 1e6,
              "cached": i["cache_read_input_token_cost"] * 1e6 if i.get("cache_read_input_token_cost") is not None else None}
             for m in litellm.model_info() for i in [m["model_info"]]]
@@ -440,13 +445,15 @@ def remove_member(pid: str, username: str, user: dict = Depends(current_user)):
     return set_project_role(pid, p, username, None)
 
 
-# ---------- platform catalog: admins add Bedrock models to LiteLLM (/model/new) ----------
+# ---------- platform catalog: admins add models to LiteLLM (/model/new) ----------
 
 # a Bedrock model ID (anthropic.claude-sonnet-5-5, eu.anthropic.claude-sonnet-5-5) or ARN (foundation model,
 # inference profile, application inference profile, provisioned throughput)
 BEDROCK_MODEL = re.compile(r"arn:aws:bedrock:([a-z]{2}(?:-gov)?-[a-z]+-\d):\d{0,12}:[a-z-]+/[\w.:/-]+|[a-z0-9-]+(?:\.[\w:-]+)+")
+SERVED_MODEL = re.compile(r"[\w.:/-]{1,200}")  # model name as the on-prem server knows it (vLLM --served-model-name)
 CATALOG_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}")
-GEO_PREFIXES = {"eu", "us", "apac", "au", "jp", "global", "us-gov"}  # cross-region inference profiles
+HOSTINGS = {"bedrock": "Bedrock", "onprem": "On-prem"}
+ONPREM_SERVERS = {"vllm": "hosted_vllm", "litellm": "litellm_proxy"}  # on-prem server -> LiteLLM provider
 
 
 def bedrock_model(model: str) -> tuple[str, str]:
@@ -460,47 +467,85 @@ def bedrock_model(model: str) -> tuple[str, str]:
     return model, m.group(1) or litellm.pricing.BEDROCK_REGION
 
 
+def aws_prices(region: str) -> dict[str, dict]:
+    try:
+        return litellm.pricing.fetch(region)
+    except (OSError, ValueError) as e:
+        raise HTTPException(502, f"AWS price list unreachable ({litellm.pricing.PRICING_URL}): {e}")
+
+
+def deployment(hosting: str, model: str, api_base: str = "", api_key: str = "", server: str = "vllm") -> tuple[dict, dict]:
+    """What LiteLLM needs to call the model (litellm_params, without prices) and what the catalog shows (model_info)."""
+    if hosting == "bedrock":
+        model_id, region = bedrock_model(model)
+        if litellm is litellm_proxy and not BEDROCK_ROLE_ARN:
+            raise HTTPException(503, "Set BEDROCK_ROLE_ARN for the governance app to add Bedrock models")
+        params = {"model": f"bedrock/converse/{model_id}",  # Converse: one request format for every Bedrock model
+                  "aws_region_name": region, "aws_session_name": "genai-gateway"}
+        if BEDROCK_ROLE_ARN:
+            params["aws_role_name"] = BEDROCK_ROLE_ARN
+        return params, {"platform": "Bedrock", "bedrock_model": model_id, "region": region}
+    if hosting == "onprem":
+        model, api_base = model.strip(), (api_base.strip() or ONPREM_API_BASE).rstrip("/")
+        if server not in ONPREM_SERVERS:
+            raise HTTPException(422, "Server must be vllm or litellm")
+        if not SERVED_MODEL.fullmatch(model):
+            raise HTTPException(422, "Model: the name the on-prem server serves it under")
+        if not re.fullmatch(r"https?://[^\s/]+(/[^\s]*)?", api_base):
+            raise HTTPException(422, "Endpoint: an http(s) URL of an OpenAI-compatible server, e.g. http://vllm.internal:8000/v1")
+        params = {"model": f"{ONPREM_SERVERS[server]}/{model}", "api_base": api_base}
+        if api_key.strip():
+            params["api_key"] = api_key.strip()  # kept encrypted by LiteLLM (LITELLM_SALT_KEY), never by this app
+        return params, {"platform": "On-prem", "endpoint": api_base, "server": server}
+    raise HTTPException(422, "Hosting must be " + " or ".join(HOSTINGS))
+
+
 @app.get("/api/catalog/lookup")
 def catalog_lookup(model: str, user: dict = Depends(admin_only)):
-    """Suggested catalog name and prices (USD per 1M tokens) for a Bedrock model, from LiteLLM's price list."""
+    """Bedrock model -> suggested catalog name, its entry in the AWS price list and the entries to pick from.
+    Prices are USD per 1M tokens, straight from AWS for the region the model is called in."""
     model_id, region = bedrock_model(model)
-    profile = model_id.rsplit("/", 1)[-1]  # an inference profile ARN ends with the profile ID
-    prefix, _, rest = profile.partition(".")
-    bare = rest if prefix in GEO_PREFIXES else profile
-    # in-region calls cost the regional rate, which LiteLLM lists under the geo profile (eu.*): the bare ID is the global rate
-    geo = {"eu": "eu", "us": "us", "ap": "apac"}.get(region.split("-")[0])
-    candidates = [profile] if prefix in GEO_PREFIXES else [f"{geo}.{bare}", bare] if geo else [bare]
-    prices = litellm.cost_map()
-    key = next((k for k in candidates if prices.get(k, {}).get("input_cost_per_token") is not None), None)
-    p = prices.get(key, {})
-    per1m = lambda f: round(p[f] * 1e6, 6) if p.get(f) is not None else None
-    return {"name": bare.split(".", 1)[-1].replace(":", "-").lower(), "model": model_id, "region": region, "price_source": key,
-            "input": per1m("input_cost_per_token"), "output": per1m("output_cost_per_token"),
-            "cache_read": per1m("cache_read_input_token_cost"), "cache_write": per1m("cache_creation_input_token_cost")}
+    prices = aws_prices(region)
+    is_global = model_id.rsplit("/", 1)[-1].startswith("global.")
+    entries = {n: p for n, p in sorted(prices.items()) if n.endswith(litellm.pricing.GLOBAL) == is_global}
+    aws_model = litellm.pricing.match(model_id, entries)
+    # suggested name: the AWS model name when matched (claude-haiku-4-5), else the ID without vendor and profile
+    name = aws_model or model_id.rsplit("/", 1)[-1].split(".", 2)[-1]
+    return {"name": re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-"), "model": model_id, "region": region,
+            "aws_model": aws_model, "prices": entries}
+
+
+@app.post("/api/catalog/test")
+def catalog_test(hosting: str = Body(...), model: str = Body(...), api_base: str = Body(""), api_key: str = Body(""),
+                 server: str = Body("vllm"), user: dict = Depends(admin_only)):
+    """Sends one short prompt with these settings through LiteLLM, before the model is added."""
+    return litellm.test_connection(deployment(hosting, model, api_base, api_key, server)[0])
 
 
 @app.post("/api/catalog", status_code=201)
-def catalog_add(name: str = Body(...), model: str = Body(...), input: float = Body(...), output: float = Body(...),
-                cache_read: float | None = Body(None), cache_write: float | None = Body(None),
+def catalog_add(hosting: str = Body(...), name: str = Body(...), model: str = Body(...), aws_model: str = Body(""),
+                api_base: str = Body(""), api_key: str = Body(""), server: str = Body("vllm"),
                 user: dict = Depends(admin_only)):
-    """Adds a Bedrock model to the catalog. Prices in USD per 1M tokens: LiteLLM bills with them."""
+    """Adds a model to the catalog. Bedrock prices come from the AWS price list (aws_model: the entry to bill with,
+    matched from the model ID when empty); on-prem models are free. LiteLLM bills calls with these prices."""
     name = name.strip().lower()
     if not CATALOG_NAME.fullmatch(name):
         raise HTTPException(422, "Name: lowercase letters, digits, dots and dashes")
     if name in {m["model_name"] for m in litellm.model_info()}:
         raise HTTPException(409, "The catalog already has a model with this name")
-    model_id, region = bedrock_model(model)
-    prices = {"input_cost_per_token": input, "output_cost_per_token": output,
-              "cache_read_input_token_cost": cache_read, "cache_creation_input_token_cost": cache_write}
-    if not all(v is None or v >= 0 for v in prices.values()):  # also rejects NaN
-        raise HTTPException(422, "Prices must be 0 or more")
-    litellm.model_add(name, {
-        "model": f"bedrock/converse/{model_id}",  # Converse: one request format for every Bedrock model
-        "aws_region_name": region,
-        "aws_role_name": "os.environ/BEDROCK_ROLE_ARN",  # resolved by LiteLLM from its own environment
-        "aws_session_name": "genai-gateway",
-        **{k: v / 1e6 for k, v in prices.items() if v is not None},
-    }, {"platform": "Bedrock", "bedrock_model": model_id})
+    params, info = deployment(hosting, model, api_base, api_key, server)
+    if hosting == "bedrock":
+        prices = aws_prices(info["region"])
+        aws_model = aws_model or litellm.pricing.match(info["bedrock_model"], prices)
+        if aws_model not in prices:
+            raise HTTPException(422, "No AWS price found for this model: pick its entry in the AWS price list")
+        p = prices[aws_model]
+        info["aws_model"] = aws_model
+    else:
+        p = {"input": 0.0, "output": 0.0}  # on-prem: no budget used
+    fields = {"input": "input_cost_per_token", "output": "output_cost_per_token",
+              "cache_read": "cache_read_input_token_cost", "cache_write": "cache_creation_input_token_cost"}
+    litellm.model_add(name, params | {fields[k]: v / 1e6 for k, v in p.items() if k in fields}, info)
     return list_models(user)
 
 

@@ -56,9 +56,13 @@ def model_delete(model_id: str):
     _call("POST", "/model/delete", {"id": model_id})
 
 
-def cost_map() -> dict:
-    # shortcut: downloads LiteLLM's whole price list (a few MB) per lookup; fine for an admin form
-    return _call("GET", "/public/litellm_model_cost_map", catalog_only="true")
+def test_connection(litellm_params: dict) -> dict:
+    """One short chat request with these settings, without adding the model (costs a fraction of a cent)."""
+    r = _call("POST", "/health/test_connection", {"litellm_params": litellm_params, "mode": "chat"})
+    if r.get("status") == "success":
+        return {"ok": True, "message": "The model answered."}
+    error = r.get("result", {}).get("error") or r
+    return {"ok": False, "message": str(error)[:500]}
 
 
 def team_new(team_alias: str, max_budget: float, models: list[str]) -> dict:

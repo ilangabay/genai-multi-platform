@@ -128,11 +128,9 @@ def model_delete(model_id: str):
     MODELS.pop(entry["model_name"], None)
 
 
-def cost_map() -> dict:
-    """Stand-in for LiteLLM's built-in price list: the prices of this config, by Bedrock ID (local runs only)."""
-    fields = ("input_cost_per_token", "output_cost_per_token", "cache_read_input_token_cost", "cache_creation_input_token_cost")
-    return {m["litellm_params"]["model"].removeprefix("bedrock/"): {f: m["model_info"][f] for f in fields if f in m["model_info"]}
-            for m in MODEL_LIST if m["litellm_params"]["model"].startswith("bedrock/")}
+def test_connection(litellm_params: dict) -> dict:
+    """Like LiteLLM's /health/test_connection. Mock: nothing leaves the process, so it always works."""
+    return {"ok": True, "message": f"[mock] no call made to {litellm_params['model']}: the real LiteLLM sends a short prompt"}
 
 
 def team_new(team_alias: str, max_budget: float, models: list[str]) -> dict:

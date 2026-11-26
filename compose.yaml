@@ -66,6 +66,10 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
       DEFAULT_PROJECT_BUDGET: ${DEFAULT_PROJECT_BUDGET:-100}
       BEDROCK_REGION: ${BEDROCK_REGION:-eu-west-3}
+      # Catalog page: Bedrock models added there use this role; prices come from PRICING_URL (needs egress to it)
+      BEDROCK_ROLE_ARN: ${BEDROCK_ROLE_ARN}
+      PRICING_URL: ${PRICING_URL:-https://pricing.us-east-1.amazonaws.com}
+      ONPREM_API_BASE: ${ONPREM_API_BASE:-http://onprem-llm.internal:8000/v1}
     ports:
       - "8000:8000"
     restart: unless-stopped

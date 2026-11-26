@@ -223,7 +223,7 @@ $('#logout').onclick = async () => { await api('/api/logout', { method: 'POST' }
 // ---------- navigation ----------
 document.querySelector('nav').onclick = async e => {
   const a = e.target.closest('a'); if (!a) return;
-  e.preventDefault(); view = a.dataset.project ? pv(a.dataset.project) : a.dataset.view; ptab = 'overview'; showKey = false; creating = false; issued = null;
+  e.preventDefault(); view = a.dataset.project ? pv(a.dataset.project) : a.dataset.view; ptab = 'overview'; showKey = false; creating = false; issued = null; adding = null;
   await (view === 'requests' || view === 'feedback' ? loadInbox() : view === 'users' ? loadUsers() : view === 'password' ? null : loadUsage());
   render(); scrollTo(0, 0);
 };
@@ -666,59 +666,106 @@ Temporary password: ${u.password}
 You will be asked to choose your own password at first sign-in.`;
 
 // ---------- catalog (admin) ----------
-function catalogView() {
-  const price1M = (name, label) => `<label class="stack">${label}
-    <input name="${name}" type="number" min="0" step="any" style="width:120px" ${name === 'input' || name === 'output' ? 'required' : ''}></label>`;
-  return `<h2>Catalog</h2>
-    <p class="muted">The models of the platform. A project can only call the catalog models an admin whitelisted on it (project page, Models tab).</p>
-    <form class="card" id="cat-form"><h3>Add a Bedrock model</h3>
-      <div class="grid">
+let adding = null;  // the Add model form: { hosting } while open
+const HOSTINGS = [['bedrock', 'AWS Bedrock'], ['onprem', 'On-prem (OpenAI-compatible server, e.g. vLLM)']];
+const awsPrice = p => p ? `$${p.input} in${p.cache_read != null ? ` · $${p.cache_read} cached` : ''} · $${p.output} out / 1M tokens` : '';
+
+function addModelForm() {
+  const h = adding.hosting;
+  return `<form class="card" id="cat-form"><h3>Add model</h3>
+    <div class="grid">
+      <label for="cat-hosting">Hosting</label>
+      <select id="cat-hosting" name="hosting">${HOSTINGS.map(([v, l]) => `<option value="${v}" ${v === h ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      ${h === 'bedrock' ? `
         <label for="cat-model">Model ID or ARN</label>
         <div class="row" style="margin:0"><input id="cat-model" name="model" required style="flex:1;min-width:240px" autocomplete="off"
           placeholder="anthropic.claude-sonnet-5-5 · eu.anthropic.claude-sonnet-5-5 · arn:aws:bedrock:…:inference-profile/…">
           <button type="button" class="ghost" id="cat-lookup">Look up</button></div>
         <label for="cat-name">Name</label><input id="cat-name" name="name" required maxlength="63" autocomplete="off"
           placeholder="What projects put in &quot;model&quot;, e.g. claude-sonnet-5-5">
-        <span>USD / 1M tokens</span><div class="row" style="margin:0;align-items:flex-end">
-          ${price1M('input', 'Input')}${price1M('output', 'Output')}${price1M('cache_read', 'Cache read')}${price1M('cache_write', 'Cache write')}</div>
-      </div>
-      <p class="muted" id="cat-source" role="status" style="margin:12px 0 0">Look up fills the name and LiteLLM's list prices for this ID. LiteLLM bills calls with the prices you save.</p>
-      <div class="row" style="margin:12px 0 0"><button>Add to catalog</button><span id="cat-msg" class="error" role="alert"></span></div>
-    </form>
-    <div class="card"><table><tr><th>Name</th><th>Platform</th><th>Provider model</th><th>Price</th><th></th></tr>
-      ${models.map(m => `<tr><td><code>${esc(m.id)}</code></td><td>${esc(platform(m))}</td><td><code>${esc(m.model)}</code></td>
-        <td class="muted">${price(m)}</td>
+        <label for="cat-aws">AWS price</label>
+        <div><select id="cat-aws" name="aws_model" required disabled><option value="">Look up the model first</option></select>
+          <div class="muted" id="cat-price" style="margin-top:4px"></div></div>`
+      : `
+        <label for="cat-server">Server</label>
+        <select id="cat-server" name="server"><option value="vllm">vLLM</option><option value="litellm">LiteLLM (on-prem proxy)</option></select>
+        <label for="cat-model">Served model</label><input id="cat-model" name="model" required autocomplete="off"
+          placeholder="The model name on that server, e.g. qwen3-32b">
+        <label for="cat-base">Endpoint</label><input id="cat-base" name="api_base" autocomplete="off" value="${esc(cfg.onprem_api_base)}">
+        <label for="cat-key">API key</label><input id="cat-key" name="api_key" type="password" autocomplete="off"
+          placeholder="If the server needs one, e.g. an on-prem LiteLLM virtual key (kept encrypted by LiteLLM)">
+        <label for="cat-name">Name</label><input id="cat-name" name="name" required maxlength="63" autocomplete="off"
+          placeholder="What projects put in &quot;model&quot;, e.g. qwen3-32b-onprem">
+        <span></span><span class="muted">Free: calls to on-prem models never use budget.</span>`}
+    </div>
+    <p class="muted" id="cat-source" role="status" style="margin:12px 0 0">${h === 'bedrock'
+      ? 'Look up reads the prices from the AWS price list for the region the model is called in. LiteLLM bills calls with them.'
+      : 'Test connection sends one short prompt to the server through LiteLLM.'}</p>
+    <div class="row" style="margin:12px 0 0"><button>Add to catalog</button>
+      <button type="button" class="ghost" id="cat-test">Test connection</button>
+      <button type="button" class="ghost" id="cat-cancel">Cancel</button>
+      <span id="cat-msg" role="status"></span></div>
+  </form>`;
+}
+
+function catalogView() {
+  return `<div class="head"><h2>Catalog</h2>${adding ? '' : '<button id="cat-add">Add model</button>'}</div>
+    <p class="muted">The models of the platform. A project can only call the catalog models an admin whitelisted on it (project page, Models tab).</p>
+    ${adding ? addModelForm() : ''}
+    <div class="card"><table><tr><th>Name</th><th>Hosting</th><th>Provider model</th><th>Price</th><th></th></tr>
+      ${models.map(m => `<tr><td><code>${esc(m.id)}</code></td><td>${esc(platform(m))}</td>
+        <td><code>${esc(m.model)}</code>${m.endpoint ? `<div class="muted">${esc(m.endpoint)}</div>` : ''}</td>
+        <td class="muted">${price(m)}${m.aws_model ? `<div>AWS: ${esc(m.aws_model)}</div>` : ''}</td>
         <td>${m.added ? `<button class="ghost" data-uncatalog="${esc(m.id)}">Remove</button>` : '<span class="muted">litellm/config.yaml</span>'}</td></tr>`).join('')}</table>
       <span id="catalog-msg" class="error" role="alert"></span></div>`;
 }
 
 function bindCatalog() {
-  const f = $('#cat-form'), num = v => v === '' ? null : Number(v);
-  $('#cat-lookup').onclick = async () => {
-    $('#cat-msg').textContent = '';
-    try {
-      const r = await api('/api/catalog/lookup?model=' + encodeURIComponent(f.model.value.trim()));
-      if (!f.name.value) f.name.value = r.name;
-      for (const k of ['input', 'output', 'cache_read', 'cache_write']) f[k].value = r[k] ?? '';
-      $('#cat-source').textContent = r.price_source
-        ? `Prices from LiteLLM's list for ${r.price_source} (calls go to ${r.region}). Check them on the AWS Bedrock pricing page before adding.`
-        : `No price known for this ID: enter the prices from the AWS Bedrock pricing page (region ${r.region}).`;
-    } catch (err) { $('#cat-msg').textContent = err.message; }
-  };
-  f.onsubmit = async e => {
-    e.preventDefault();
-    try {
-      models = await api('/api/catalog', { method: 'POST', body: JSON.stringify({ name: f.name.value, model: f.model.value,
-        input: num(f.input.value), output: num(f.output.value), cache_read: num(f.cache_read.value), cache_write: num(f.cache_write.value) }) });
-      render();
-    } catch (err) { $('#cat-msg').textContent = err.message; }
-  };
+  const add = $('#cat-add');
+  if (add) add.onclick = () => { adding = { hosting: 'bedrock' }; render(); $('#cat-model').focus(); };
   document.querySelectorAll('[data-uncatalog]').forEach(b => b.onclick = async () => {
     const name = b.dataset.uncatalog;
     if (!confirm(`Remove ${name} from the catalog? Projects lose access to it at once.`)) return;
     try { models = await api('/api/catalog/' + encodeURIComponent(name), { method: 'DELETE' }); await refresh(); }
     catch (err) { $('#catalog-msg').textContent = err.message; }
   });
+  const f = $('#cat-form');
+  if (!f) return;
+  const say = (text, error) => { $('#cat-msg').innerHTML = `<span class="${error ? 'error' : 'muted'}">${esc(text)}</span>`; };
+  const fields = () => Object.fromEntries(new FormData(f));
+  let prices = {};
+  f.hosting.onchange = () => { adding = { hosting: f.hosting.value }; render(); $('#cat-model').focus(); };
+  $('#cat-cancel').onclick = () => { adding = null; render(); };
+  const showPrice = () => { $("#cat-price").textContent = awsPrice(prices[f.aws_model.value]); };
+  if ($('#cat-lookup')) $('#cat-lookup').onclick = async () => {
+    say('Reading the AWS price list…');
+    try {
+      const r = await api('/api/catalog/lookup?model=' + encodeURIComponent(f.model.value.trim()));
+      prices = r.prices;
+      if (!f.name.value) f.name.value = r.name;
+      f.aws_model.disabled = false;
+      f.aws_model.innerHTML = `<option value="">${r.aws_model ? '' : 'Not found automatically: pick the model'}</option>`
+        + Object.keys(prices).map(n => `<option ${n === r.aws_model ? 'selected' : ''}>${esc(n)}</option>`).join('');
+      f.aws_model.onchange = showPrice; showPrice();
+      say(r.aws_model ? `Found in the AWS price list for ${r.region}. Check the entry, then test or add.`
+                      : `No automatic match in the ${r.region} price list: pick the right entry.`, !r.aws_model);
+    } catch (err) { say(err.message, true); }
+  };
+  $('#cat-test').onclick = async () => {
+    if (!f.model.reportValidity()) return;
+    say('Sending a short prompt…');
+    try {
+      const r = await api('/api/catalog/test', { method: 'POST', body: JSON.stringify(fields()) });
+      say((r.ok ? '✓ ' : '✗ ') + r.message, !r.ok);
+    } catch (err) { say(err.message, true); }
+  };
+  f.onsubmit = async e => {
+    e.preventDefault();
+    try {
+      models = await api('/api/catalog', { method: 'POST', body: JSON.stringify(fields()) });
+      adding = null; render();
+    } catch (err) { say(err.message, true); }
+  };
 }
 
 function usersView() {

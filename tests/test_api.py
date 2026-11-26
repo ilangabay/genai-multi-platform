@@ -395,31 +395,64 @@ def test_projects_pick_models_from_the_catalog():
     assert team("bob-tools")["models"] == ["claude-opus-5-5", "claude-sonnet-5-5"]
 
 
-def test_admin_adds_and_removes_bedrock_models_in_the_catalog():
+AWS_PRICES = {"Claude Sonnet 5.5": {"input": 2.2, "output": 11.0, "cache_read": 0.11, "cache_write": 2.75},
+              "Claude Sonnet 5.5 (global)": {"input": 2.0, "output": 10.0}, "Nova Pro": {"input": 1.18, "output": 4.72}}
+
+
+def test_admin_adds_bedrock_and_onprem_models_to_the_catalog(monkeypatch):
+    monkeypatch.setattr(pricing, "fetch", lambda region: AWS_PRICES)
     a = admin()
     assert login("bob", "user").get("/api/catalog/lookup?model=anthropic.claude-sonnet-5-5").status_code == 403
     found = a.get("/api/catalog/lookup?model=arn:aws:bedrock:eu-west-3::foundation-model/anthropic.claude-sonnet-5-5").json()
-    assert found["name"] == "claude-sonnet-5-5" and found["input"] == 2.2 and found["cache_read"] == 0.11
-    unknown = a.get("/api/catalog/lookup?model=eu.amazon.nova-pro-v1:0").json()
-    assert unknown["name"] == "nova-pro-v1-0" and unknown["input"] is None
+    assert found["aws_model"] == "Claude Sonnet 5.5" and found["name"] == "claude-sonnet-5-5"
+    assert "Claude Sonnet 5.5 (global)" not in found["prices"]  # in-region: regional rates only
+    assert a.get("/api/catalog/lookup?model=global.anthropic.claude-sonnet-5-5").json()["aws_model"] == "Claude Sonnet 5.5 (global)"
+    assert a.get("/api/catalog/lookup?model=meta.llama3-2-1b-instruct-v1:0").json()["aws_model"] is None
     assert a.get("/api/catalog/lookup?model=curl http://x").status_code == 422
 
-    new = {"name": "nova-pro", "model": "eu.amazon.nova-pro-v1:0", "input": 0.8, "output": 3.2}
-    assert a.post("/api/catalog", json={**new, "name": "claude-opus-5-5"}).status_code == 409
-    assert a.post("/api/catalog", json={**new, "input": -1}).status_code == 422
-    listed = {m["id"]: m for m in a.post("/api/catalog", json=new).json()}
-    assert listed["nova-pro"]["added"] and listed["nova-pro"]["input"] == 0.8 and not listed["claude-opus-5-5"]["added"]
-    params = litellm_mock.MODELS["nova-pro"]["litellm_params"]
-    assert params["model"] == "bedrock/converse/eu.amazon.nova-pro-v1:0" and params["aws_role_name"] == "os.environ/BEDROCK_ROLE_ARN"
+    assert a.post("/api/catalog/test", json={"hosting": "bedrock", "model": "eu.amazon.nova-pro-v1:0"}).json()["ok"]
+    assert a.post("/api/catalog/test", json={"hosting": "onprem", "model": "x", "api_base": "ftp://x"}).status_code == 422
 
-    # projects can whitelist it, and calls are billed with its prices
-    a.put("/api/projects/contract-review/models", json={"models": ["nova-pro"]})
-    r = call(a, main.PROJECTS["contract-review"]["api_key"], "nova-pro")
-    assert r.status_code == 200 and float(r.headers["x-litellm-response-cost"]) > 0
+    # Bedrock: prices from AWS, nothing typed by the admin
+    nova = {"hosting": "bedrock", "name": "nova-pro", "model": "eu.amazon.nova-pro-v1:0"}
+    assert a.post("/api/catalog", json={**nova, "name": "claude-opus-5-5"}).status_code == 409
+    assert a.post("/api/catalog", json={**nova, "name": "llama", "model": "meta.llama3-2-1b-instruct-v1:0"}).status_code == 422
+    listed = {m["id"]: m for m in a.post("/api/catalog", json=nova).json()}
+    assert listed["nova-pro"]["added"] and listed["nova-pro"]["input"] == 1.18 and listed["nova-pro"]["aws_model"] == "Nova Pro"
+    params = litellm_mock.MODELS["nova-pro"]["litellm_params"]
+    assert params["model"] == "bedrock/converse/eu.amazon.nova-pro-v1:0" and params["aws_region_name"] == "eu-west-3"
+
+    # On-prem: free, with its own endpoint
+    listed = {m["id"]: m for m in a.post("/api/catalog", json={"hosting": "onprem", "name": "qwen-onprem", "model": "qwen3-32b",
+                                                               "api_base": "http://gpu01.internal:8000/v1/"}).json()}
+    assert listed["qwen-onprem"]["platform"] == "On-prem" and listed["qwen-onprem"]["input"] == 0
+    assert litellm_mock.MODELS["qwen-onprem"]["litellm_params"] == {"model": "hosted_vllm/qwen3-32b", "api_base": "http://gpu01.internal:8000/v1",
+                                                                     "input_cost_per_token": 0.0, "output_cost_per_token": 0.0}
+
+    # projects can whitelist them, and calls are billed with the AWS prices
+    key = main.PROJECTS["contract-review"]["api_key"]
+    a.put("/api/projects/contract-review/models", json={"models": ["nova-pro", "qwen-onprem"]})
+    assert float(call(a, key, "nova-pro").headers["x-litellm-response-cost"]) > 0
+    assert float(call(a, key, "qwen-onprem").headers["x-litellm-response-cost"]) == 0
+    behind_litellm = {"hosting": "onprem", "server": "litellm", "name": "llama-onprem", "model": "llama-3.3-70b", "api_key": "sk-onprem"}
+    a.post("/api/catalog", json=behind_litellm)
+    assert litellm_mock.MODELS["llama-onprem"]["litellm_params"]["model"] == "litellm_proxy/llama-3.3-70b"
+    assert a.post("/api/catalog/test", json={**behind_litellm, "server": "tgi"}).status_code == 422
 
     assert a.delete("/api/catalog/claude-opus-5-5").status_code == 409  # from litellm/config.yaml
     assert "nova-pro" not in {m["id"] for m in a.delete("/api/catalog/nova-pro").json()}
-    assert team("contract-review")["models"] == [litellm_mock.NO_MODELS]  # taken off the project too
-    a.post("/api/catalog", json=new)
+    assert team("contract-review")["models"] == ["qwen-onprem"]  # taken off the project too
+    a.delete("/api/catalog/llama-onprem")
     main.startup()  # memory mode keeps nothing: the catalog is back to the config models, with no leftover
-    assert "nova-pro" not in litellm_mock.MODELS and len(litellm_mock.MODEL_LIST) == 5
+    assert "qwen-onprem" not in litellm_mock.MODELS and len(litellm_mock.MODEL_LIST) == 5
+
+
+def test_price_files_are_matched_to_model_ids():
+    names = ["Claude Sonnet 5.5", "Claude Sonnet 5.5 (global)", "Claude 3.5 Sonnet v2", "Claude Haiku 4.5", "Nova Pro", "Mistral Large"]
+    assert pricing.match("eu.anthropic.claude-sonnet-5-5", names) == "Claude Sonnet 5.5"
+    assert pricing.match("global.anthropic.claude-sonnet-5-5", names) == "Claude Sonnet 5.5 (global)"
+    assert pricing.match("anthropic.claude-3-5-sonnet-20241022-v2:0", names) == "Claude 3.5 Sonnet v2"
+    assert pricing.match("arn:aws:bedrock:eu-west-3:1:inference-profile/eu.anthropic.claude-haiku-4-5-20251001-v1:0", names) == "Claude Haiku 4.5"
+    assert pricing.match("amazon.nova-pro-v1:0", names) == "Nova Pro"
+    assert pricing.match("mistral.mistral-large-2402-v1:0", names) == "Mistral Large"
+    assert pricing.match("meta.llama3-2-1b-instruct-v1:0", names) is None

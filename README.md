@@ -74,9 +74,13 @@ Configuration is by environment variables. Copy `.env.example` to `.env` (gitign
 **Admins**
 - See all projects and create new ones (name, owner, members, budget; a key is generated).
 - Change budgets, revoke and regenerate API keys.
-- Catalog page: the platform's models. Add a Bedrock model by model ID or ARN (inference profiles too): **Look up**
-  pre-fills a name and LiteLLM's list prices, the admin checks them and saves (LiteLLM `/model/new`). Added models can
-  be removed, which also takes them off every project. Models from `litellm/config.yaml` stay until removed there.
+- Catalog page, **Add model**, hosting **AWS Bedrock** or **On-prem** (LiteLLM `/model/new`):
+  - Bedrock: model ID or ARN (inference profiles too). **Look up** finds the model in the public AWS price list for
+    the region it is called in and shows its prices; the admin types no price (an unmatched ID: pick the entry).
+  - On-prem: the server (vLLM, or the on-prem LiteLLM in front of it), the model name on that server, its endpoint and
+    an optional API key (e.g. an on-prem LiteLLM virtual key). Free.
+  - **Test connection** sends one short prompt through LiteLLM before adding (LiteLLM `/health/test_connection`).
+  - Added models can be removed, which also takes them off every project. Models from `litellm/config.yaml` stay.
 - Each project has a whitelist of catalog models (LiteLLM team `models`): picked at creation or later in its Models tab,
   **none by default**. Any other model gets `401 team_model_access_denied`.
   Calls to a model that is not enabled get `401 team_model_access_denied`.
