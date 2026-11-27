@@ -1,50 +1,14 @@
 # LiteLLM proxy config (image: litellm/Dockerfile, service: compose.yaml).
 #
-# AWS access: LiteLLM calls STS AssumeRole into BEDROCK_ROLE_ARN, using the VM's own identity as the caller.
-# That identity comes from IAM Roles Anywhere (the VM certificate), see litellm/aws-config.example and docs/aws-setup.md.
+# Only the on-prem defaults live here. Bedrock models are added from the governance app's Catalog page
+# (LiteLLM /model/new, kept in LiteLLM's database): their prices come from the AWS price list and are re-synced every
+# PRICE_SYNC_HOURS, which LiteLLM only allows for models stored in its database, not for models in this file.
+# After the first start, add claude-opus-5-5, claude-sonnet-5-5 and claude-haiku-5-5 there (Add model > Look up > Add).
 #
-# Prices: USD per token. Bedrock rows are the in-region on-demand list prices for eu-west-3
-# (AWS price file of 2026-11-11). LiteLLM's built-in prices for these IDs are the lower global ones,
-# so they are set here. `uv run python -m app.pricing` prints the current ones (needs pricing.us-east-1 access).
-# The governance app reads models and prices back from /model/info: nothing to change there.
+# AWS access of those models: LiteLLM calls STS AssumeRole into BEDROCK_ROLE_ARN, from the VM's own identity
+# (IAM Roles Anywhere), see litellm/aws-config.example and docs/aws-setup.md.
 
 model_list:
-  - model_name: claude-opus-5-5
-    litellm_params:
-      model: bedrock/anthropic.claude-opus-5-5
-      aws_region_name: os.environ/BEDROCK_REGION
-      aws_role_name: os.environ/BEDROCK_ROLE_ARN
-      aws_session_name: genai-gateway
-      input_cost_per_token: 0.0000044
-      output_cost_per_token: 0.000022
-      cache_read_input_token_cost: 0.00000022
-      cache_creation_input_token_cost: 0.0000055
-    model_info: {platform: Bedrock}
-
-  - model_name: claude-sonnet-5-5
-    litellm_params:
-      model: bedrock/anthropic.claude-sonnet-5-5
-      aws_region_name: os.environ/BEDROCK_REGION
-      aws_role_name: os.environ/BEDROCK_ROLE_ARN
-      aws_session_name: genai-gateway
-      input_cost_per_token: 0.0000022
-      output_cost_per_token: 0.000011
-      cache_read_input_token_cost: 0.00000011
-      cache_creation_input_token_cost: 0.00000275
-    model_info: {platform: Bedrock}
-
-  - model_name: claude-haiku-5-5
-    litellm_params:
-      model: bedrock/anthropic.claude-haiku-5-5
-      aws_region_name: os.environ/BEDROCK_REGION
-      aws_role_name: os.environ/BEDROCK_ROLE_ARN
-      aws_session_name: genai-gateway
-      input_cost_per_token: 0.00000011
-      output_cost_per_token: 0.00000055
-      cache_read_input_token_cost: 0.000000011
-      cache_creation_input_token_cost: 0.0000001375
-    model_info: {platform: Bedrock}
-
   # On-prem (OpenAI-compatible, e.g. vLLM): free, so calls never use budget. They fail until ONPREM_API_BASE answers.
   - model_name: mistral-small-onprem
     litellm_params:

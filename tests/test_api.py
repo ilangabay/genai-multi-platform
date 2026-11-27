@@ -130,22 +130,18 @@ def test_price_file_parsing_and_sync():
         "a": row("EUW3-MP:EUW3_input_tokens_standard-Units", "3.0"),
         "b": row("EUW3-MP:EUW3_output_tokens_standard-Units", "0.015", unit="1K tokens"),
         "c": row("EUW3-MP:EUW3_cache_read_tokens_standard-Units", "0.3"),
-        "d": row("EUW3-MP:EUW3_input_tokens_global_standard-Units", "1.0"),     # cross-region, ignored
+        "d": row("EUW3-MP:EUW3_input_tokens_global_standard-Units", "1.0"),     # global: under "(global)", no output: dropped
         "e": row("EUW3-MP:EUW3_input_tokens_long_ctx_standard-Units", "9.0"),   # long context, ignored
+        "f": row("EUW3-MP:EUW3_output_tokens_long_ctx_standard-Units", "99"),   # long context, ignored
+        "g": row("EUW3-MP:EUW3_cache_write_tokens_1h_standard-Units", "9.9"),   # 1-hour cache, ignored
     }
+    for r in rows.values():  # AWS tags long-context and 1h rows like the standard ones: they must not override them
+        r["attributes"]["inferenceType"] = "Output tokens" if "output" in r["attributes"]["usagetype"] else "Input tokens"
     offer = {"products": {k: {"attributes": v["attributes"]} for k, v in rows.items()},
              "terms": {"OnDemand": {k: v["terms"] for k, v in rows.items()}}}
     prices = pricing.parse(offer)
     assert prices == {"Claude Sonnet 5.5": {"input": 3.0, "output": 15.0, "cache_read": 0.3}}
 
-    info = litellm_mock.MODELS["claude-sonnet-5-5"]["model_info"]
-    before = dict(info)
-    try:
-        assert litellm_mock.sync_prices(prices) == ["claude-sonnet-5-5"]
-        assert abs(info["input_cost_per_token"] - 3e-6) < 1e-15 and abs(info["output_cost_per_token"] - 15e-6) < 1e-15
-        assert info["cache_creation_input_token_cost"] == before["cache_creation_input_token_cost"]  # not in file: kept
-    finally:
-        info.clear(); info.update(before)
 
 
 def test_requests_flow():
@@ -456,3 +452,25 @@ def test_price_files_are_matched_to_model_ids():
     assert pricing.match("amazon.nova-pro-v1:0", names) == "Nova Pro"
     assert pricing.match("mistral.mistral-large-2402-v1:0", names) == "Mistral Large"
     assert pricing.match("meta.llama3-2-1b-instruct-v1:0", names) is None
+
+
+def test_prices_follow_the_aws_price_list(monkeypatch):
+    aws = {"Claude Sonnet 5.5": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
+           "Claude Opus 5.5": {"input": 4.4, "output": 22.0, "cache_read": 0.22, "cache_write": 5.5},
+           "Claude Haiku 5.5": {"input": 0.11, "output": 0.55, "cache_read": 0.011, "cache_write": 0.1375}}
+    monkeypatch.setattr(pricing, "fetch", lambda region, max_age=0: aws)
+    key, a = main.PROJECTS["contract-review"]["api_key"], admin()
+    before = float(call(a, key, "claude-sonnet-5-5").headers["x-litellm-response-cost"])
+    assert login("bob", "user").post("/api/catalog/sync").status_code == 403
+    status = a.post("/api/catalog/sync").json()
+    assert status["updated"] == ["claude-sonnet-5-5"] and status["at"] and not status["errors"]  # Opus and Haiku unchanged
+    info = litellm_mock.MODELS["claude-sonnet-5-5"]["model_info"]
+    assert abs(info["input_cost_per_token"] - 3e-6) < 1e-15 and abs(info["cache_creation_input_token_cost"] - 3.75e-6) < 1e-15
+    after = float(call(a, key, "claude-sonnet-5-5").headers["x-litellm-response-cost"])
+    assert after > before  # the next call is billed at the new rate
+    assert a.post("/api/catalog/sync").json()["updated"] == []  # nothing changed since
+
+    del aws["Claude Haiku 5.5"]  # gone from the AWS list: old prices kept, the admin sees why
+    status = a.get("/api/catalog/sync").json() | a.post("/api/catalog/sync").json()
+    assert status["errors"] and "claude-haiku-5-5" in status["errors"][0]
+    assert litellm_mock.MODELS["claude-haiku-5-5"]["model_info"]["input_cost_per_token"] == 0.11e-6

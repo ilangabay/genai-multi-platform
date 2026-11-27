@@ -6,9 +6,11 @@ of that team. Spend is read back from LiteLLM, never computed here.
 In production, apps call the guardrail LiteLLM endpoint, which forwards to the LiteLLM router
 serving Bedrock and on-prem models; app/litellm_mock.py stands in for both.
 """
+import asyncio
 import hashlib
 import hmac
 import itertools
+import logging
 import os
 import re
 import secrets
@@ -32,7 +34,8 @@ SESSION_HOURS = float(os.environ.get("SESSION_HOURS", "12"))  # a sign-in expire
 # Catalog page: the role LiteLLM assumes for Bedrock (not secret; LiteLLM refuses os.environ/ references in test calls)
 BEDROCK_ROLE_ARN = os.environ.get("BEDROCK_ROLE_ARN", "")
 ONPREM_API_BASE = os.environ.get("ONPREM_API_BASE", "http://onprem-llm.internal:8000/v1")  # default endpoint of new on-prem models
-COOKIE_SECURE = os.environ.get("COOKIE_SECURE") == "1"  # set to 1 when the app is served over HTTPS
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE") == "1"
+PRICE_SYNC_HOURS = float(os.environ.get("PRICE_SYNC_HOURS", "6"))  # AWS prices re-read this often; 0 = never  # set to 1 when the app is served over HTTPS
 STATIC = Path(__file__).parent / "static"
 DEFAULT_ADMIN_PASSWORDS = {"admin", "change-me-at-first-sign-in"}  # public in this repo, refused with a database
 
@@ -142,10 +145,20 @@ def startup():
         litellm.seed_history(add_project(name, owner, members, budget)["team_id"], spend, seed=len(PROJECTS))
 
 
+async def price_sync_loop():
+    """At start, then every PRICE_SYNC_HOURS: keeps the prices LiteLLM bills with equal to the AWS price list."""
+    while True:
+        await asyncio.to_thread(sync_catalog_prices)
+        await asyncio.sleep(PRICE_SYNC_HOURS * 3600)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     startup()
+    task = asyncio.create_task(price_sync_loop()) if PRICE_SYNC_HOURS > 0 else None
     yield
+    if task:
+        task.cancel()
 
 
 app = FastAPI(title="GenAI gateway - governance (mock)", lifespan=lifespan)
@@ -453,6 +466,9 @@ BEDROCK_MODEL = re.compile(r"arn:aws:bedrock:([a-z]{2}(?:-gov)?-[a-z]+-\d):\d{0,
 SERVED_MODEL = re.compile(r"[\w.:/-]{1,200}")  # model name as the on-prem server knows it (vLLM --served-model-name)
 CATALOG_NAME = re.compile(r"[a-z0-9][a-z0-9.-]{0,62}")
 HOSTINGS = {"bedrock": "Bedrock", "onprem": "On-prem"}
+# AWS price list (USD per 1M tokens, app.pricing) -> LiteLLM's per-token price fields
+PRICE_FIELDS = {"input": "input_cost_per_token", "output": "output_cost_per_token",
+                "cache_read": "cache_read_input_token_cost", "cache_write": "cache_creation_input_token_cost"}
 ONPREM_SERVERS = {"vllm": "hosted_vllm", "litellm": "litellm_proxy"}  # on-prem server -> LiteLLM provider
 
 
@@ -543,10 +559,50 @@ def catalog_add(hosting: str = Body(...), name: str = Body(...), model: str = Bo
         info["aws_model"] = aws_model
     else:
         p = {"input": 0.0, "output": 0.0}  # on-prem: no budget used
-    fields = {"input": "input_cost_per_token", "output": "output_cost_per_token",
-              "cache_read": "cache_read_input_token_cost", "cache_write": "cache_creation_input_token_cost"}
-    litellm.model_add(name, params | {fields[k]: v / 1e6 for k, v in p.items() if k in fields}, info)
+    litellm.model_add(name, params | {PRICE_FIELDS[k]: v / 1e6 for k, v in p.items()}, info)
     return list_models(user)
+
+
+PRICE_SYNC = {"at": None, "updated": [], "errors": []}  # last run, shown on the Catalog page
+
+
+def sync_catalog_prices() -> dict:
+    """Re-reads the AWS price list for every catalog model that has an AWS price entry, and gives LiteLLM the new
+    prices of those that changed. Every call after that is billed at the new rates; past calls keep theirs."""
+    updated, errors = [], []
+    for m in litellm.model_info():
+        info = m["model_info"]
+        if not info.get("aws_model"):
+            continue  # on-prem (free) and models without an AWS entry
+        try:
+            p = litellm.pricing.fetch(info.get("region") or litellm.pricing.BEDROCK_REGION, max_age=600)[info["aws_model"]]
+        except KeyError:
+            errors.append(f"{m['model_name']}: {info['aws_model']} is no longer in the AWS price list, old prices kept")
+            continue
+        except (OSError, ValueError) as e:
+            errors.append(f"{m['model_name']}: AWS price list unreachable ({e}), old prices kept")
+            continue
+        new = {PRICE_FIELDS[k]: v / 1e6 for k, v in p.items()}
+        if any(abs((info.get(f) or 0) - v) > 1e-15 for f, v in new.items()):
+            try:
+                litellm.model_update(info["id"], m["litellm_params"]["model"], new)
+                updated.append(m["model_name"])
+            except HTTPException as e:
+                errors.append(f"{m['model_name']}: {e.detail}")
+    PRICE_SYNC.update(at=now(), updated=updated, errors=errors)
+    for e in errors:
+        logging.getLogger(__name__).error("Price sync: %s", e)
+    return PRICE_SYNC
+
+
+@app.get("/api/catalog/sync")
+def price_sync_status(user: dict = Depends(admin_only)):
+    return PRICE_SYNC | {"every_hours": PRICE_SYNC_HOURS}
+
+
+@app.post("/api/catalog/sync")
+def price_sync_now(user: dict = Depends(admin_only)):
+    return sync_catalog_prices() | {"every_hours": PRICE_SYNC_HOURS}
 
 
 @app.delete("/api/catalog/{name}")

@@ -133,7 +133,7 @@ Session duration: keep the default 1 hour (role chaining caps it at 1 hour anywa
 - Proxy allowlist, HTTPS 443:
   `rolesanywhere.eu-west-3.amazonaws.com`, `sts.eu-west-3.amazonaws.com`, `bedrock-runtime.eu-west-3.amazonaws.com`
   (LiteLLM container), and `pricing.us-east-1.amazonaws.com` (governance app: public AWS price list, read when an
-  admin adds a Bedrock model; GET only, no credentials, no data sent).
+  admin adds a Bedrock model and every `PRICE_SYNC_HOURS`; GET only, no credentials, no data sent).
 - `docker compose up --build -d`
 
 ## 7. Check

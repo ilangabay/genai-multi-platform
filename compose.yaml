@@ -69,6 +69,7 @@ services:
       # Catalog page: Bedrock models added there use this role; prices come from PRICING_URL (needs egress to it)
       BEDROCK_ROLE_ARN: ${BEDROCK_ROLE_ARN}
       PRICING_URL: ${PRICING_URL:-https://pricing.us-east-1.amazonaws.com}
+      PRICE_SYNC_HOURS: ${PRICE_SYNC_HOURS:-6}  # prices re-read from AWS this often, then given to LiteLLM
       ONPREM_API_BASE: ${ONPREM_API_BASE:-http://onprem-llm.internal:8000/v1}
     ports:
       - "8000:8000"

@@ -224,7 +224,7 @@ $('#logout').onclick = async () => { await api('/api/logout', { method: 'POST' }
 document.querySelector('nav').onclick = async e => {
   const a = e.target.closest('a'); if (!a) return;
   e.preventDefault(); view = a.dataset.project ? pv(a.dataset.project) : a.dataset.view; ptab = 'overview'; showKey = false; creating = false; issued = null; adding = null;
-  await (view === 'requests' || view === 'feedback' ? loadInbox() : view === 'users' ? loadUsers() : view === 'password' ? null : loadUsage());
+  await (view === 'requests' || view === 'feedback' ? loadInbox() : view === 'users' ? loadUsers() : view === 'catalog' ? loadPriceSync() : view === 'password' ? null : loadUsage());
   render(); scrollTo(0, 0);
 };
 $('#main').addEventListener('click', async e => {
@@ -667,6 +667,21 @@ You will be asked to choose your own password at first sign-in.`;
 
 // ---------- catalog (admin) ----------
 let adding = null;  // the Add model form: { hosting } while open
+let priceSync = null;  // last AWS price sync: { at, updated, errors, every_hours }
+async function loadPriceSync() { priceSync = await api('/api/catalog/sync'); }
+const when = iso => new Date(iso).toLocaleString('en', { dateStyle: 'medium', timeStyle: 'short' });
+
+function priceSyncLine() {
+  const s = priceSync;
+  if (!s) return '';
+  const every = s.every_hours > 0 ? `every ${s.every_hours} h` : 'off (PRICE_SYNC_HOURS=0)';
+  const last = !s.at ? 'not run yet'
+    : `last run ${when(s.at)}: ${s.updated.length ? `new prices for ${s.updated.map(esc).join(', ')}` : 'no price changed'}`;
+  return `<div class="card"><div class="head"><h3>AWS prices</h3><button class="ghost" id="cat-sync">Sync prices now</button></div>
+    <p class="muted" style="margin:0" role="status">Bedrock prices are re-read from the AWS price list ${every}, ${last}.
+      LiteLLM bills every call with the current prices.</p>
+    ${s.errors.length ? `<ul class="error" style="margin:8px 0 0">${s.errors.map(e => `<li>${esc(e)}</li>`).join('')}</ul>` : ''}</div>`;
+}
 const HOSTINGS = [['bedrock', 'AWS Bedrock'], ['onprem', 'On-prem (OpenAI-compatible server, e.g. vLLM)']];
 const awsPrice = p => p ? `$${p.input} in${p.cache_read != null ? ` · $${p.cache_read} cached` : ''} · $${p.output} out / 1M tokens` : '';
 
@@ -711,6 +726,7 @@ function addModelForm() {
 function catalogView() {
   return `<div class="head"><h2>Catalog</h2>${adding ? '' : '<button id="cat-add">Add model</button>'}</div>
     <p class="muted">The models of the platform. A project can only call the catalog models an admin whitelisted on it (project page, Models tab).</p>
+    ${priceSyncLine()}
     ${adding ? addModelForm() : ''}
     <div class="card"><table><tr><th>Name</th><th>Hosting</th><th>Provider model</th><th>Price</th><th></th></tr>
       ${models.map(m => `<tr><td><code>${esc(m.id)}</code></td><td>${esc(platform(m))}</td>
@@ -721,6 +737,12 @@ function catalogView() {
 }
 
 function bindCatalog() {
+  const sync = $('#cat-sync');
+  if (sync) sync.onclick = async () => {
+    sync.disabled = true; sync.textContent = 'Syncing…';
+    try { priceSync = await api('/api/catalog/sync', { method: 'POST' }); models = await api('/api/models'); render(); }
+    catch (err) { sync.disabled = false; sync.textContent = 'Sync prices now'; $('#catalog-msg').textContent = err.message; }
+  };
   const add = $('#cat-add');
   if (add) add.onclick = () => { adding = { hosting: 'bedrock' }; render(); $('#cat-model').focus(); };
   document.querySelectorAll('[data-uncatalog]').forEach(b => b.onclick = async () => {

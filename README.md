@@ -53,7 +53,7 @@ Configuration is by environment variables. Copy `.env.example` to `.env` (gitign
 | `DEFAULT_PROJECT_BUDGET` | `100`                                     | USD budget for new projects and project requests               |
 | `BEDROCK_REGION`         | `eu-west-3`                               | Region of the in-region Bedrock models and of their prices     |
 | `PRICING_URL`            | `https://pricing.us-east-1.amazonaws.com` | AWS Price List Bulk API (public, needs a proxy allowlist entry) |
-| `SYNC_PRICES`            | `0`                                       | `1` loads Bedrock prices from `PRICING_URL` at startup         |
+| `PRICE_SYNC_HOURS`       | `6`                                       | Bedrock prices re-read from `PRICING_URL` and given to LiteLLM this often (0 = never) |
 | `ONPREM_API_BASE`        | `http://onprem-llm.internal:8000/v1`      | On-prem upstream in LiteLLM's model config                     |
 
 ## Features
@@ -116,25 +116,30 @@ master key: `/team/new`, `/team/update`, `/team/info`, `/key/generate`, `/key/de
 
 ## Bedrock prices
 
-`app/pricing.py` reads in-region on-demand token prices (input, output, cache read, cache write) from the
-public AWS Price List Bulk API: `AmazonBedrockFoundationModels/current/<BEDROCK_REGION>/index.json`.
+LiteLLM bills every call with the per-token prices of the model (input, output, cache read, cache write). For Bedrock
+models these come from the public AWS Price List Bulk API (`app/pricing.py`), for the region the model is called in:
+the `AmazonBedrockFoundationModels` (Anthropic, OpenAI...) and `AmazonBedrock` (Nova, Mistral...) price files.
 No AWS credentials or IAM permission are needed; the proxy must allow the host in `PRICING_URL`.
-The built-in prices are the eu-west-3 rates of the 2026-11-11 price file.
+
+- When an admin adds a model, **Look up** matches its ID to the price list entry (`model_info.aws_model`).
+- The governance app re-reads the price list at startup and every `PRICE_SYNC_HOURS` (default 6), and gives LiteLLM
+  the new prices of the models that changed (`PATCH /model/{id}/update`). Every call after that is billed at the new
+  rates; past calls keep the price they were billed at. The Catalog page shows the last run and has **Sync prices now**.
+- If a model disappears from the price list or the list is unreachable, its prices stay as they were and the Catalog
+  page shows why.
+- LiteLLM only lets the API change models stored in its database, so Bedrock models are added from the Catalog page,
+  not written in `litellm/config.yaml` (which only keeps the free on-prem defaults).
+
+Rates used: in-region and EU-profile calls use the `*_standard` rows, `global.*` profiles the `*_global_standard`
+rows. Long-context (`*_long_ctx_*`), 1-hour cache, flex, priority and batch rates are not used. These are list
+prices; Savings Plans and private discounts are not included, so the AWS bill stays the reference.
 
 ```bash
 uv run python -m app.pricing          # print current prices for BEDROCK_REGION
-SYNC_PRICES=1 uv run uvicorn app.main:app --port 8000   # load them at startup
 ```
 
-Each Bedrock model maps to its price-file name through `model_info.aws_model` (for example `Claude Sonnet 5.5`).
-Only `*_standard` rows are used: `*_global_standard` is global cross-region inference, `*_long_ctx_*` and `*_1h_*`
-are long-context and 1-hour-cache rates. These are list prices; Savings Plans and private discounts are not included,
-so the AWS bill stays the reference.
-
 ```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" -H "Content-Type: application/json" \
-  -d '{"model": "claude-sonnet-5-5", "messages": [{"role": "user", "content": "Hello"}]}'
+curl http://localhost:8000/v1/chat/completions   -H "Authorization: Bearer $GATEWAY_API_KEY" -H "Content-Type: application/json"   -d '{"model": "claude-sonnet-5-5", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
 The `Demo sandbox` project (owner `alice`) has a $0.02 budget so you hit the limit after two calls.
@@ -167,7 +172,7 @@ STORAGE=postgres DATABASE_URL=postgresql://gateway:secret@db.internal:5432/gatew
 |----------------------|----------------------|------|
 | `Dockerfile`         | `genai-gateway`      | The app: Python 3.12 slim, dependencies from `uv.lock` (no dev tools), non-root user, one uvicorn process on port 8000, healthcheck on `/`. Defaults to `STORAGE=memory`. |
 | `postgres/Dockerfile`| `genai-gateway-db`   | PostgreSQL 17 with role `gateway`, databases `gateway` (app) and `litellm` (LiteLLM), healthcheck with `pg_isready`. The password is given at run time, never built in. |
-| `litellm/Dockerfile` | `genai-gateway-litellm` | LiteLLM proxy `v1.108.7` with `litellm/config.yaml` (models, eu-west-3 prices) and `aws_signing_helper` for IAM Roles Anywhere. Port 4000. |
+| `litellm/Dockerfile` | `genai-gateway-litellm` | LiteLLM proxy `v1.108.7` with `litellm/config.yaml` (on-prem defaults) and `aws_signing_helper` for IAM Roles Anywhere. Port 4000. |
 | `compose.yaml`       |                      | All three: the app in `postgres` mode driving LiteLLM, the database on a named volume (`pgdata`) and not published outside. |
 
 Before the first start, set up AWS with [docs/aws-setup.md](docs/aws-setup.md): it ends with `certs/gateway.crt`,
@@ -179,6 +184,8 @@ docker compose up --build -d
 ```
 
 Then open http://localhost:8000 and sign in as admin with `ADMIN_PASSWORD`; it must be changed at first sign-in.
+On the Catalog page, add the Bedrock models (Add model > AWS Bedrock > model ID > Look up > Add to catalog), e.g.
+`anthropic.claude-opus-5-5`, `anthropic.claude-sonnet-5-5`, `anthropic.claude-haiku-5-5`.
 Projects get real LiteLLM keys for `LITELLM_BASE_URL` (port 4000): every call goes to Bedrock and is billed to the project.
 Compose refuses to start while a required value is missing. LiteLLM's own admin UI is on http://localhost:4000/ui (master key).
 
@@ -217,5 +224,4 @@ The PostgreSQL test works in a throwaway schema that it drops afterwards.
 - Project API keys are stored in clear so the UI can show them again; real LiteLLM keeps only hashes and shows a key once.
 - Notifications for requests (email or Teams).
 - Anthropic-format `/v1/messages` in the mock (LiteLLM supports it in production).
-- A price sync for the real LiteLLM: prices are in `litellm/config.yaml`, update them by hand (`python -m app.pricing` prints them).
 - The deployment with the real LiteLLM has not been run end to end yet (Docker, AWS account).

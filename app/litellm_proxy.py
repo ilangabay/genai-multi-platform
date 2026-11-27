@@ -52,6 +52,11 @@ def model_add(model_name: str, litellm_params: dict, model_info: dict) -> dict:
     return _call("POST", "/model/new", {"model_name": model_name, "litellm_params": litellm_params, "model_info": model_info})
 
 
+def model_update(model_id: str, litellm_model: str, prices: dict):
+    """New per-token prices for a model stored in LiteLLM's database (config.yaml models cannot be edited)."""
+    _call("PATCH", f"/model/{urllib.parse.quote(model_id)}/update", {"litellm_params": {"model": litellm_model, **prices}})
+
+
 def model_delete(model_id: str):
     _call("POST", "/model/delete", {"id": model_id})
 

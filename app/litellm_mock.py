@@ -11,7 +11,6 @@ over HTTP with the master key in production (/team/new, /team/update, /team/info
 /key/generate, /key/delete, /model/info).
 """
 import json
-import logging
 import os
 import random
 import secrets
@@ -30,7 +29,7 @@ ONPREM_API_BASE = os.environ.get("ONPREM_API_BASE", "http://onprem-llm.internal:
 
 def _model(name, platform, params, inp=0.0, out=0.0, cache_read=None, cache_write=None, aws_model=None):
     """Prices in USD per 1M tokens -> LiteLLM model_list entry (per-token costs)."""
-    info = {"platform": platform, "input_cost_per_token": inp / M, "output_cost_per_token": out / M}
+    info = {"id": name, "platform": platform, "input_cost_per_token": inp / M, "output_cost_per_token": out / M}
     if cache_read is not None:
         info |= {"cache_read_input_token_cost": cache_read / M, "cache_creation_input_token_cost": cache_write / M}
     if aws_model:
@@ -44,8 +43,8 @@ def _bedrock(name, model_id, aws_model, *prices):
                   *prices, aws_model=aws_model)
 
 
-# Bedrock: regional on-demand prices for eu-west-3 from the AWS price file of 2026-11-11, replaced at
-# startup when SYNC_PRICES=1. On-prem models are free: zero prices, so calls never touch the budget.
+# Bedrock: regional on-demand prices for eu-west-3 from the AWS price file of 2026-11-11, kept current by the
+# price sync of the governance app (main.sync_catalog_prices). On-prem models are free: calls never touch the budget.
 MODEL_LIST = [
     _bedrock("claude-opus-5-5", "anthropic.claude-opus-5-5", "Claude Opus 5.5", 4.4, 22.0, 0.22, 5.5),
     _bedrock("claude-sonnet-5-5", "anthropic.claude-sonnet-5-5", "Claude Sonnet 5.5", 2.2, 11.0, 0.11, 2.75),
@@ -53,20 +52,6 @@ MODEL_LIST = [
     _model("mistral-small-onprem", "On-prem", {"model": "hosted_vllm/mistral-small", "api_base": ONPREM_API_BASE}),
     _model("llama-70b-onprem", "On-prem", {"model": "hosted_vllm/llama-3.3-70b", "api_base": ONPREM_API_BASE}),
 ]
-
-
-def sync_prices(prices: dict[str, dict]) -> list[str]:
-    """Load AWS prices (USD per 1M tokens, from app.pricing) into the model config. Returns the models updated.
-    Production: the same job calls LiteLLM's /model/update instead."""
-    fields = {"input": "input_cost_per_token", "output": "output_cost_per_token",
-              "cache_read": "cache_read_input_token_cost", "cache_write": "cache_creation_input_token_cost"}
-    updated = []
-    for m in MODEL_LIST:
-        p = prices.get(m["model_info"].get("aws_model"), {})
-        if {"input", "output"} <= p.keys():  # skip models missing from the price file, keep their old prices
-            m["model_info"] |= {fields[k]: v / M for k, v in p.items() if k in fields}
-            updated.append(m["model_name"])
-    return updated
 
 
 MODELS = {m["model_name"]: m for m in MODEL_LIST}
@@ -85,11 +70,6 @@ LOCK = threading.Lock()
 
 def startup():
     """Load state from the store; called by the app at startup (main.startup)."""
-    if os.environ.get("SYNC_PRICES") == "1":
-        try:
-            logging.getLogger(__name__).warning("Bedrock prices synced for %s", sync_prices(pricing.fetch()))
-        except (OSError, ValueError) as e:  # keep serving with the built-in prices
-            logging.getLogger(__name__).error("Price sync failed, using built-in prices: %s", e)
     TEAMS.clear()
     TEAMS.update(store.STORE.load("litellm_mock_teams"))
     KEYS.clear()
@@ -118,6 +98,15 @@ def model_add(model_name: str, litellm_params: dict, model_info: dict) -> dict:
     MODEL_LIST.append(entry)
     MODELS[model_name] = entry
     return entry
+
+
+def model_update(model_id: str, litellm_model: str, prices: dict):
+    """Like LiteLLM's PATCH /model/{id}/update with new per-token prices: later calls are billed with them."""
+    entry = next(m for m in MODEL_LIST if m["model_info"].get("id") == model_id)
+    entry["litellm_params"] |= prices
+    entry["model_info"] |= prices
+    if entry["model_info"].get("db_model"):
+        store.STORE.save("litellm_mock_models", model_id, entry)
 
 
 def model_delete(model_id: str):

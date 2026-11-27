@@ -5,8 +5,10 @@ the host in PRICING_URL (default pricing.us-east-1.amazonaws.com). Two offers ho
 - AmazonBedrockFoundationModels (Anthropic, OpenAI, Cohere...): usage types like
   EUW3-MP:EUW3_input_tokens_standard-Units, per 1M tokens. *_global_standard rows are global
   cross-region inference; *_long_ctx_* and *_1h_* rows are long-context and 1-hour cache rates.
-- AmazonBedrock (Amazon Nova, Mistral, Meta...): inferenceType "Input tokens", "Output tokens",
-  "Prompt cache read/write input tokens", per 1K tokens. Flex, priority and batch rows are skipped.
+- AmazonBedrock (Amazon Nova, Mistral, Meta...): usage types like EUW3-NovaPro-input-tokens, per 1K tokens.
+  Flex, priority and batch rows (other suffixes) are skipped.
+Only the standard on-demand rate of each kind is kept: long-context and 1-hour-cache rows also say "Input tokens"
+in inferenceType, so rows are told apart by their usage type, never by inferenceType.
 The files name models ("Claude Sonnet 5.5"), not model IDs: match() maps an ID to a name.
 
     uv run python -m app.pricing            # print prices for BEDROCK_REGION as JSON
@@ -24,8 +26,9 @@ GLOBAL = " (global)"  # suffix of the global cross-region rates of a model
 
 _ROW = re.compile(r"_(input_tokens|output_tokens|cache_read_tokens|cache_write_tokens)_(global_)?standard-Units$")
 _KIND = {"input_tokens": "input", "output_tokens": "output", "cache_read_tokens": "cache_read", "cache_write_tokens": "cache_write"}
-_INFERENCE = {"Input tokens": "input", "Output tokens": "output",
-              "Prompt cache read input tokens": "cache_read", "Prompt cache write input tokens": "cache_write"}
+_ROW_1K = re.compile(r"-(input-tokens|output-tokens|cache-read-input-token-count|cache-write-input-token-count)$")
+_KIND_1K = {"input-tokens": "input", "output-tokens": "output",
+            "cache-read-input-token-count": "cache_read", "cache-write-input-token-count": "cache_write"}
 _PER_M = {"1M tokens": 1, "1K tokens": 1000}
 _cache: dict[str, tuple[float, dict]] = {}
 
@@ -40,8 +43,8 @@ def parse(offer: dict) -> dict[str, dict]:
             continue
         if m := _ROW.search(a.get("usagetype", "")):
             name, kind = a["model"] + (GLOBAL if m.group(2) else ""), _KIND[m.group(1)]
-        elif a.get("inferenceType") in _INFERENCE:
-            name, kind = a["model"], _INFERENCE[a["inferenceType"]]
+        elif m := _ROW_1K.search(a.get("usagetype", "")):
+            name, kind = a["model"], _KIND_1K[m.group(1)]
         else:
             continue
         for term in offer["terms"].get("OnDemand", {}).get(sku, {}).values():
@@ -51,9 +54,9 @@ def parse(offer: dict) -> dict[str, dict]:
     return {name: p for name, p in prices.items() if {"input", "output"} <= p.keys()}
 
 
-def fetch(region: str = BEDROCK_REGION) -> dict[str, dict]:
-    """Both Bedrock price files of the region, kept for an hour (they change a few times a month)."""
-    if region in _cache and time.monotonic() - _cache[region][0] < 3600:
+def fetch(region: str = BEDROCK_REGION, max_age: float = 3600) -> dict[str, dict]:
+    """Both Bedrock price files of the region, reused for max_age seconds (they change a few times a month)."""
+    if region in _cache and time.monotonic() - _cache[region][0] < max_age:
         return _cache[region][1]
     prices = {}
     for offer in OFFERS:
